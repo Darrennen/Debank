@@ -1,17 +1,14 @@
 # shadow_nav_board.py
-# Shadow NAV board: Board view + Single wallet view per your UI spec.
+# Shadow NAV board: single-page UI (board + selected wallet details below)
 
 import os
 import time
 import socket
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
-# ---------------- DeBank client (focused) ----------------
 
 DEFAULT_BASE_URL = "https://pro-openapi.debank.com"
 
@@ -28,7 +25,7 @@ class DebankClient:
         max_retries: int = 3,
         backoff: float = 0.8,
         proxies: Optional[Dict[str, str]] = None,
-        user_agent: str = "shadow-nav/board/1.0",
+        user_agent: str = "shadow-nav/board/1.1",
     ) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.api_key = api_key or os.getenv("DEBANK_API_KEY")
@@ -50,7 +47,6 @@ class DebankClient:
         self.session.mount("http://", adapter)
         if proxies:
             self.session.proxies.update(proxies)
-
         self.user_agent = user_agent
 
     def _headers(self) -> Dict[str, str]:
@@ -90,7 +86,7 @@ class DebankClient:
         data = r.json()
         return data["data"] if isinstance(data, dict) and "data" in data else data
 
-    # ---- endpoints we need ----
+    # Endpoints used
     def get_total_balance(self, addr: str) -> Dict[str, Any]:
         return self._get("/v1/user/total_balance", {"id": addr})
 
@@ -102,16 +98,15 @@ class DebankClient:
 
 
 # ---------------- Streamlit UI ----------------
-
 try:
     import streamlit as st
 except Exception:
     st = None
 
 if st:
-    st.set_page_config(page_title="Shadow NAV Board", layout="wide")
+    st.set_page_config(page_title="Shadow NAV Board (One Page)", layout="wide")
 
-    # ------------- Sidebar setup -------------
+    # Sidebar
     st.sidebar.header("Setup")
     api_key = st.sidebar.text_input("DEBANK_API_KEY", value=os.getenv("DEBANK_API_KEY", ""), type="password")
     base_url = st.sidebar.text_input("Base URL", value=os.getenv("DEBANK_BASE_URL", DEFAULT_BASE_URL))
@@ -119,25 +114,25 @@ if st:
     show_debug = st.sidebar.toggle("Show debug tracebacks", value=False)
 
     st.sidebar.divider()
-    st.sidebar.caption("Enter wallets (one per line). Format options:\n"
-                       "  Client, Wallet Label, 0xAddress\n"
-                       "  Wallet Label, 0xAddress\n"
-                       "  0xAddress  (auto-labeled Wallet N)")
+    st.sidebar.caption(
+        "Enter wallets (one per line). Formats:\n"
+        "  Client, Wallet Label, 0xAddress\n"
+        "  Wallet Label, 0xAddress\n"
+        "  0xAddress  (auto-labeled Wallet N)"
+    )
     wallets_text = st.sidebar.text_area(
         "Wallets",
-        placeholder="Darren, Darren #1, 0x123...\nDarren, Darren #2, 0xabc...\nDarren, Darren #3, 0xdef...\nAlice, Wallet A, 0x456...",
+        placeholder="Darren, Darren #1, 0x123...\nDarren, Darren #2, 0xabc...\nAlice, Wallet A, 0x456...",
         height=140,
     )
-    if "refresh_nonce" not in st.session_state:
-        st.session_state.refresh_nonce = 0
-    if "view" not in st.session_state:
-        st.session_state.view = "board"   # "board" or "detail"
+
+    # State
+    if "wallets" not in st.session_state:
+        st.session_state.wallets = []
     if "active_idx" not in st.session_state:
         st.session_state.active_idx = None
-    if "wallets" not in st.session_state:
-        st.session_state.wallets = []     # list of dicts: {client, label, addr}
-    if "comments" not in st.session_state:
-        st.session_state.comments = {}    # addr -> list of {ts, text}
+    if "refresh_nonce" not in st.session_state:
+        st.session_state.refresh_nonce = 0
 
     def parse_wallets(text: str) -> List[Dict[str, str]]:
         items, i = [], 1
@@ -153,27 +148,21 @@ if st:
                 label, addr = parts[0], parts[1]
             else:
                 addr = parts[0]
-            if not label:
-                label = f"Wallet {i}"
-            if not client:
-                client = "Unassigned"
+            label = label or f"Wallet {i}"
+            client = client or "Unassigned"
             items.append({"client": client, "label": label, "addr": addr})
             i += 1
         return items
 
     col_sb1, col_sb2 = st.sidebar.columns(2)
-    load = col_sb1.button("Load Wallets")
-    clear = col_sb2.button("Clear All")
-    if load:
+    if col_sb1.button("Load Wallets"):
         st.session_state.wallets = parse_wallets(wallets_text)
-        st.session_state.view = "board"
         st.session_state.active_idx = None
-    if clear:
+    if col_sb2.button("Clear All"):
         st.session_state.wallets = []
-        st.session_state.view = "board"
         st.session_state.active_idx = None
 
-    # ------------- Build client -------------
+    # Build client
     def build_client() -> Optional[DebankClient]:
         if not api_key:
             st.error("Please provide DEBANK_API_KEY.")
@@ -188,7 +177,7 @@ if st:
 
     api = build_client()
 
-    # ------------- Helpers -------------
+    # Helpers
     def safe_call(msg, fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
@@ -208,7 +197,6 @@ if st:
         except Exception:
             return "-"
 
-    # --- Table helpers (INDENTED inside `if st:`) ---
     def position_rows(positions):
         rows = []
         for p in positions or []:
@@ -227,8 +215,6 @@ if st:
                 "Protocol": p.get("name") or p.get("id"),
                 "Chain": p.get("chain"),
                 "USD Value": usd,
-                "TVL": p.get("tvl"),
-                "Site": p.get("site_url"),
             })
         rows.sort(key=lambda r: (r["USD Value"] or 0), reverse=True)
         return rows
@@ -248,141 +234,114 @@ if st:
                 "Amount": t.get("amount"),
                 "Price": t.get("price"),
                 "USD Value": usd,
-                "Protocol": t.get("protocol_id") or "",
             })
         rows.sort(key=lambda r: (r["USD Value"] or 0), reverse=True)
         return rows
 
-    # ------------- Views -------------
-    st.title("Shadow NAV Board")
+    # --------- PAGE: Board (top) + Selected Wallet Pane (bottom) ---------
+    st.title("Shadow NAV Board — One Page")
 
-    if st.session_state.view == "board":
-        # ===== Board View =====
-        st.caption("Board view: filter by client, select to sum total, delete rows, click wallet to open detail.")
+    if not st.session_state.wallets:
+        st.info("Add wallets in the sidebar and click **Load Wallets**.")
+        st.stop()
 
-        if not st.session_state.wallets:
-            st.info("Add wallets in the sidebar and click **Load Wallets**.")
-            st.stop()
+    # Filters / actions
+    clients = sorted({w["client"] for w in st.session_state.wallets})
+    sel_clients = st.multiselect("Filter by Client", options=clients, default=clients)
+    c1, c2, c3 = st.columns([1,1,3])
+    if c1.button("Refresh balances"):
+        st.session_state.refresh_nonce = int(time.time())
 
-        # Filter by Client
-        clients = sorted({w["client"] for w in st.session_state.wallets})
-        sel_clients = st.multiselect("Filter by Client", options=clients, default=clients)
+    selected_total_placeholder = c2.empty()
+    selected_total_value = 0.0
 
-        # Refresh & Sum controls
-        c1, c2, c3 = st.columns([1,1,2])
-        if c1.button("Refresh balances"):
-            st.session_state.refresh_nonce = int(time.time())
+    # Board list
+    st.markdown("### Wallets")
+    hdr = st.columns([2, 3, 4, 2, 1, 1])
+    hdr[0].markdown("**Client**")
+    hdr[1].markdown("**Wallet**")
+    hdr[2].markdown("**Address**")
+    hdr[3].markdown("**Dollar Value**")
+    hdr[4].markdown("**Select**")
+    hdr[5].markdown("**Delete**")
 
-        selected_total_placeholder = c2.empty()
-        selected_total_value = 0.0
+    to_delete_idx = None
+    for idx, w in enumerate(st.session_state.wallets):
+        if w["client"] not in sel_clients:
+            continue
 
-        # Table-ish list
-        st.markdown("### Wallets")
-        hdr = st.columns([2, 3, 3, 2, 1, 1])
-        hdr[0].markdown("**Client**")
-        hdr[1].markdown("**Wallet**")
-        hdr[2].markdown("**Address**")
-        hdr[3].markdown("**Dollar Value**")
-        hdr[4].markdown("**Select**")
-        hdr[5].markdown("**Delete**")
+        cols = st.columns([2, 3, 4, 2, 1, 1])
+        cols[0].write(w["client"])
 
-        for idx, w in enumerate(st.session_state.wallets):
-            if w["client"] not in sel_clients:
-                continue
+        # Clicking either the label or the address selects the wallet
+        if cols[1].button(w["label"], key=f"open_label_{idx}"):
+            st.session_state.active_idx = idx
+        if cols[2].button(w["addr"], key=f"open_addr_{idx}"):
+            st.session_state.active_idx = idx
 
-            cols = st.columns([2, 3, 3, 2, 1, 1])
-            cols[0].write(w["client"])
-            # Clicking the wallet label opens detail view
-            if cols[1].button(w["label"], key=f"open_{idx}"):
-                st.session_state.view = "detail"
-                st.session_state.active_idx = idx
-                st.rerun()
+        total = {"total_usd_value": None}
+        if api:
+            total = safe_call(f"{w['label']} total", api.get_total_balance, w["addr"]) or total
+        cols[3].write(fmt_usd(total.get("total_usd_value") or total.get("usd_value") or 0))
 
-            cols[2].code(w["addr"], language=None)
+        sel = cols[4].checkbox("", key=f"sel_{idx}")
+        if sel:
+            try:
+                selected_total_value += float(total.get("total_usd_value") or total.get("usd_value") or 0)
+            except Exception:
+                pass
 
-            total = {"total_usd_value": None}
-            if api:
-                total = safe_call(f"{w['label']} total", api.get_total_balance, w["addr"]) or total
-            cols[3].write(fmt_usd(total.get("total_usd_value") or total.get("usd_value") or 0))
+        if cols[5].button("🗑", key=f"del_{idx}"):
+            to_delete_idx = idx
 
-            sel = cols[4].checkbox("", key=f"sel_{idx}")
-            if sel:
-                try:
-                    selected_total_value += float(total.get("total_usd_value") or total.get("usd_value") or 0)
-                except Exception:
-                    pass
-
-            if cols[5].button("🗑", key=f"del_{idx}"):
-                st.session_state.wallets.pop(idx)
-                st.rerun()
-
-        selected_total_placeholder.metric("Selected Total Balance", fmt_usd(selected_total_value))
-
-    else:
-        # ===== Single Wallet View =====
-        idx = st.session_state.active_idx
-        if idx is None or idx >= len(st.session_state.wallets):
-            st.session_state.view = "board"
-            st.rerun()
-
-        w = st.session_state.wallets[idx]
-        st.markdown(f"### {w['client']} — {w['label']}")
-
-        topbar = st.columns([1,1,6,2])
-        if topbar[0].button("← Back"):
-            st.session_state.view = "board"
+    if to_delete_idx is not None:
+        # Clear selection if we delete the selected row
+        if st.session_state.active_idx == to_delete_idx:
             st.session_state.active_idx = None
-            st.rerun()
-        if topbar[1].button("Refresh"):
+        st.session_state.wallets.pop(to_delete_idx)
+        st.rerun()
+
+    selected_total_placeholder.metric("Selected Total Balance", fmt_usd(selected_total_value))
+
+    # ---- Selected wallet details (appear below the board) ----
+    st.markdown("---")
+    st.markdown("### Selected Wallet")
+
+    if st.session_state.active_idx is None or st.session_state.active_idx >= len(st.session_state.wallets):
+        st.caption("Click a wallet label or address above to view details here.")
+    else:
+        w = st.session_state.wallets[st.session_state.active_idx]
+        header_cols = st.columns([6,1,1])
+        header_cols[0].markdown(f"**{w['client']} — {w['label']}**  \n`{w['addr']}`")
+        if header_cols[1].button("↻ Refresh", key="detail_refresh"):
             st.session_state.refresh_nonce = int(time.time())
+            st.rerun()
+        if header_cols[2].button("Clear Selection", key="detail_clear"):
+            st.session_state.active_idx = None
             st.rerun()
 
         # Dollar Value
-        total = {"total_usd_value": 0, "chain_list": []}
+        total = {"total_usd_value": 0}
         if api:
             total = safe_call("Total Balance", api.get_total_balance, w["addr"]) or total
-        st.metric("Total Balance (USD)", fmt_usd(total.get("total_usd_value") or total.get("usd_value") or 0))
+        st.metric("Dollar Value", fmt_usd(total.get("total_usd_value") or total.get("usd_value") or 0))
 
-        # DeFi Position & Coins
-        c1, c2 = st.columns(2)
+        # Details: DeFi Positions + Token Holdings
+        d1, d2 = st.columns(2)
 
-        with c1:
-            st.markdown("**DeFi Positions (top 15 by USD)**")
+        with d1:
+            st.markdown("**DeFi Positions**")
             positions = safe_call("DeFi positions", api.get_complex_protocol_list, w["addr"]) or []
-            st.dataframe(position_rows(positions)[:15], use_container_width=True)
+            st.dataframe(position_rows(positions), use_container_width=True)
             if show_debug:
-                st.caption("Debug sample:")
-                st.json((positions or [])[:1])
+                st.caption("Debug sample:"); st.json((positions or [])[:1])
 
-        with c2:
-            st.markdown("**Coins in Wallet (top 25 by USD)**")
+        with d2:
+            st.markdown("**Token Holdings**")
             tokens = safe_call("Coins in wallet", api.get_all_token_list, w["addr"], True) or []
             st.dataframe(token_rows(tokens)[:25], use_container_width=True)
             if show_debug:
-                st.caption("Debug sample:")
-                st.json((tokens or [])[:1])
-
-        # Comment Log
-        st.markdown("### Comment Log")
-        addr = w["addr"]
-        if addr not in st.session_state.comments:
-            st.session_state.comments[addr] = []
-        with st.expander("Add a comment"):
-            comment_text = st.text_area("Note", placeholder="What happened to this wallet?", key=f"note_{idx}")
-            if st.button("Save Comment", key=f"save_{idx}"):
-                if comment_text.strip():
-                    st.session_state.comments[addr].append({
-                        "ts": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-                        "text": comment_text.strip(),
-                    })
-                    st.success("Saved.")
-                else:
-                    st.warning("Please type something before saving.")
-
-        if st.session_state.comments[addr]:
-            st.markdown("**History**")
-            for entry in reversed(st.session_state.comments[addr][-50:]):
-                st.write(f"- *{entry['ts']}*: {entry['text']}")
+                st.caption("Debug sample:"); st.json((tokens or [])[:1])
 
 else:
     if __name__ == "__main__":
