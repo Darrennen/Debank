@@ -359,13 +359,21 @@ def token_rows(tokens):
         c1, c2 = st.columns(2)
 
         with c1:
-            st.markdown("**DeFi Position (all chains, cached)**")
+            st.markdown("**DeFi Positions (top 15 by USD)**")
             positions = safe_call("DeFi positions", api.get_complex_protocol_list, w["addr"]) or []
-            st.json(positions[:15])
+            st.dataframe(position_rows(positions)[:15], use_container_width=True)
+            if show_debug:
+                st.caption("Debug sample:")
+                st.json((positions or [])[:1])
 
         with c2:
-            st.markdown("**Coins in Wallet (all chains)**")
+            st.markdown("**Coins in Wallet (top 25 by USD)**")
             tokens = safe_call("Coins in wallet", api.get_all_token_list, w["addr"], True) or []
+            st.dataframe(token_rows(tokens)[:25], use_container_width=True)
+            if show_debug:
+                st.caption("Debug sample:")
+                st.json((tokens or [])[:1])
+
 
             def token_usd(t):
                 if isinstance(t, dict):
