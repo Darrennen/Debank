@@ -1,8 +1,8 @@
 # shadow_nav_board.py
-# Shadow NAV board — one-page UI with per-wallet comment log + persistence.
+# Shadow NAV board — one-page UI with per-wallet comment log + persistence + Hyperliquid.
 # - Uses Streamlit Secrets when available (DEBANK_API_KEY / DEBANK_BASE_URL / DEBANK_HEADER_NAME)
 # - Persists wallets & comments to local JSON (shadow_nav_store.json) so they survive reload/log out
-# - Board at top; click a wallet to show Dollar Value, DeFi Positions, and Token Holdings below
+# - Board at top; click a wallet to show Dollar Value, DeFi Positions, Token Holdings **and Hyperliquid** below
 
 import os
 import json
@@ -33,7 +33,7 @@ class DebankClient:
         max_retries: int = 3,
         backoff: float = 0.8,
         proxies: Optional[Dict[str, str]] = None,
-        user_agent: str = "shadow-nav/board/1.4",
+        user_agent: str = "shadow-nav/board/1.5",
     ) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.api_key = api_key or os.getenv("DEBANK_API_KEY")
@@ -104,6 +104,173 @@ class DebankClient:
 
     def get_complex_protocol_list(self, addr: str) -> List[Dict[str, Any]]:
         return self._get("/v1/user/all_complex_protocol_list", {"id": addr})
+
+
+# ---------------- Hyperliquid client (read-only) ----------------
+class HyperliquidError(Exception):
+    pass
+
+class HyperliquidClient:
+    INFO_URL = "https://api.hyperliquid.xyz/info"
+
+    def __init__(self, timeout: int = 20, max_retries: int = 3, backoff: float = 0.8) -> None:
+        self.timeout = timeout
+        self.session = requests.Session()
+        retry = Retry(
+            total=max_retries,
+            backoff_factor=backoff,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST"],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_maxsize=50)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+    def _post(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            r = self.session.post(self.INFO_URL, json=payload, timeout=self.timeout)
+        except requests.exceptions.RequestException as e:
+            raise HyperliquidError(f"Network error calling HL info: {e}") from e
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            raise HyperliquidError(f"HTTP {r.status_code} from HL info: {r.text[:400]}") from e
+        try:
+            return r.json()
+        except Exception as e:
+            raise HyperliquidError(f"Bad JSON from HL info: {e}") from e
+
+    # API wrappers
+    def get_perp_state(self, addr: str) -> Dict[str, Any]:
+        return self._post({"type": "clearinghouseState", "user": addr})
+
+    def get_spot_state(self, addr: str) -> Dict[str, Any]:
+        return self._post({"type": "spotClearinghouseState", "user": addr})
+
+    def get_perp_meta(self) -> Dict[str, Any]:
+        return self._post({"type": "metaAndAssetCtxs"})
+
+    def get_spot_meta(self) -> Dict[str, Any]:
+        return self._post({"type": "spotMetaAndAssetCtxs"})
+
+    # helpers to build price maps {coin: mark_price}
+    @staticmethod
+    def _build_price_map(perp_meta: Dict[str, Any], spot_meta: Dict[str, Any]) -> Dict[str, float]:
+        mp: Dict[str, float] = {}
+        # Perp meta
+        try:
+            asset_ctxs = (perp_meta or {}).get("assetCtxs") or []
+            for ctx in asset_ctxs:
+                coin = ctx.get("name") or ctx.get("coin")
+                price = ctx.get("markPx") or ctx.get("oraclePx") or ctx.get("indexPx")
+                if coin and price is not None:
+                    try:
+                        mp[coin] = float(price)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Spot meta
+        try:
+            sctxs = (spot_meta or {}).get("assetCtxs") or []
+            for ctx in sctxs:
+                coin = ctx.get("name") or ctx.get("coin")
+                price = ctx.get("markPx") or ctx.get("oraclePx") or ctx.get("indexPx")
+                if coin and price is not None and coin not in mp:
+                    try:
+                        mp[coin] = float(price)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return mp
+
+    @staticmethod
+    def perp_rows(state: Dict[str, Any], price_map: Dict[str, float]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        # Try common layouts
+        positions = state.get("assetPositions") or state.get("positions") or []
+        account_value = state.get("accountValue") or state.get("equity")
+
+        for pos in positions:
+            # Some responses wrap position details under "position"
+            core = pos.get("position") or pos
+            coin = core.get("coin") or core.get("symbol") or ""
+            szi  = core.get("szi") or core.get("size") or 0
+            entry = core.get("entryPx") or core.get("entryPrice") or None
+            mark  = pos.get("markPx") or core.get("markPx") or price_map.get(coin)
+            upnl  = pos.get("uPnL") or pos.get("unrealizedPnl") or core.get("uPnL") or 0
+
+            try:
+                size = float(szi)
+            except Exception:
+                size = 0.0
+            try:
+                entry_f = float(entry) if entry is not None else None
+            except Exception:
+                entry_f = None
+            try:
+                mark_f = float(mark) if mark is not None else None
+            except Exception:
+                mark_f = None
+            try:
+                upnl_f = float(upnl) if upnl is not None else 0.0
+            except Exception:
+                upnl_f = 0.0
+
+            usd_val = None
+            if mark_f is not None:
+                usd_val = size * mark_f
+
+            rows.append({
+                "Market": coin,
+                "Size": size,
+                "Entry": entry_f,
+                "Mark": mark_f,
+                "uPnL": upnl_f,
+                "USD Value": usd_val,
+            })
+
+        # optional: show account value as a dummy row if there are no positions
+        if not rows and account_value is not None:
+            try:
+                rows.append({"Market": "(Account)", "Size": None, "Entry": None, "Mark": None,
+                             "uPnL": None, "USD Value": float(account_value)})
+            except Exception:
+                pass
+
+        # sort by abs USD value (or uPnL if no USD)
+        def sort_key(r):
+            v = r.get("USD Value")
+            if v is None:
+                return abs(r.get("uPnL") or 0)
+            return abs(v)
+        rows.sort(key=sort_key, reverse=True)
+        return rows
+
+    @staticmethod
+    def spot_rows(state: Dict[str, Any], price_map: Dict[str, float]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        # Try common layouts
+        balances = state.get("balances") or state.get("assetPositions") or []
+        for b in balances:
+            coin = b.get("coin") or b.get("symbol") or (b.get("position") or {}).get("coin")
+            amt  = b.get("total") or b.get("size") or b.get("amount") or (b.get("position") or {}).get("szi")
+            try:
+                amount = float(amt or 0)
+            except Exception:
+                amount = 0.0
+            px = b.get("markPx") or b.get("oraclePx") or price_map.get(coin)
+            try:
+                price = float(px) if px is not None else None
+            except Exception:
+                price = None
+            usd = amount * price if (price is not None) else None
+            rows.append({"Coin": coin, "Amount": amount, "Price": price, "USD Value": usd})
+
+        rows.sort(key=lambda r: abs(r.get("USD Value") or 0), reverse=True)
+        return rows
 
 
 # ---------------- Streamlit UI ----------------
@@ -178,6 +345,8 @@ if st:
     if have_api_key:
         st.sidebar.success("Using DEBANK_API_KEY from secrets/env")
 
+    include_hl = st.sidebar.toggle("Include Hyperliquid (perps & spot)", value=True)
+
     st.sidebar.divider()
     st.sidebar.caption(
         "Enter wallets (one per line). Formats:\n"
@@ -224,24 +393,32 @@ if st:
         st.session_state.active_idx = None
         save_store(st.session_state.wallets, st.session_state.comments, st.session_state.active_idx)
 
-    # ---- Build client ----
-    def build_client() -> Optional[DebankClient]:
+    # ---- Build clients ----
+    def build_debank() -> Optional[DebankClient]:
         if not api_key:
             st.error("Please provide DEBANK_API_KEY.")
             return None
         try:
             return DebankClient(api_key=api_key, base_url=base_url, header_name=header_name)
         except Exception as e:
-            st.error(f"Client init failed: {e}")
+            st.error(f"DeBank client init failed: {e}")
             return None
 
-    api = build_client()
+    def build_hl() -> Optional[HyperliquidClient]:
+        try:
+            return HyperliquidClient()
+        except Exception as e:
+            st.error(f"Hyperliquid client init failed: {e}")
+            return None
+
+    api = build_debank()
+    hl = build_hl() if include_hl else None
 
     # ---- Helpers ----
     def safe_call(msg, fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
-        except DebankError as e:
+        except (DebankError, HyperliquidError) as e:
             st.error(f"{msg}: {e}")
         except Exception as e:
             st.error(f"{msg}: Unexpected error: {e}")
@@ -306,7 +483,7 @@ if st:
     sel_clients = st.multiselect("Filter by Client", options=clients, default=clients)
     c1, c2, c3 = st.columns([1, 1, 3])
     if c1.button("Refresh balances"):
-        st.session_state.refresh_nonce = int(time.time())  # used only to trigger rerender paths
+        st.session_state.refresh_nonce = int(time.time())  # trigger rerender paths
 
     selected_total_placeholder = c2.empty()
     selected_total_value = 0.0
@@ -400,13 +577,13 @@ if st:
             save_store(st.session_state.wallets, st.session_state.comments, st.session_state.active_idx)
             do_rerun()
 
-        # Dollar Value
+        # Dollar Value (DeBank)
         total = {"total_usd_value": 0}
         if api:
             total = safe_call("Total Balance", api.get_total_balance, w["addr"]) or total
         st.metric("Dollar Value", fmt_usd(total.get("total_usd_value") or total.get("usd_value") or 0))
 
-        # Details: DeFi Positions + Token Holdings
+        # Details: DeFi Positions + Token Holdings (DeBank)
         d1, d2 = st.columns(2)
 
         with d1:
@@ -418,6 +595,26 @@ if st:
             st.markdown("**Token Holdings**")
             tokens = safe_call("Coins in wallet", api.get_all_token_list, w["addr"], True) or []
             st.dataframe(token_rows(tokens)[:25], use_container_width=True)
+
+        # Hyperliquid (optional)
+        if hl:
+            st.markdown("#### Hyperliquid")
+            # Pull state + meta; build price map once
+            perp_state = safe_call("Hyperliquid perps", hl.get_perp_state, w["addr"]) or {}
+            spot_state = safe_call("Hyperliquid spot", hl.get_spot_state, w["addr"]) or {}
+            perp_meta  = safe_call("Hyperliquid perp meta", hl.get_perp_meta) or {}
+            spot_meta  = safe_call("Hyperliquid spot meta", hl.get_spot_meta) or {}
+            price_map  = HyperliquidClient._build_price_map(perp_meta, spot_meta)
+
+            h1, h2 = st.columns(2)
+            with h1:
+                st.markdown("**Perps**")
+                perp_rows = HyperliquidClient.perp_rows(perp_state, price_map)
+                st.dataframe(perp_rows, use_container_width=True)
+            with h2:
+                st.markdown("**Spot**")
+                spot_rows = HyperliquidClient.spot_rows(spot_state, price_map)
+                st.dataframe(spot_rows, use_container_width=True)
 
 else:
     if __name__ == "__main__":
