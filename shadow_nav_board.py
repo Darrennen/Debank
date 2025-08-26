@@ -1,9 +1,10 @@
 # shadow_nav_board.py
 # Shadow NAV board — one-page UI with per-wallet comment log + persistence + Hyperliquid price fix.
-# Changes in this revision:
-# - Hyperliquid price build prefers midPx (then markPx, then prevDayPx)
-# - Combined Total metric = DeBank total + HL spot (+ optional perps equity)
-# - "Explain price" helper to show which pair/path set each token's USD price
+# - DeBank for on-chain (EVM) assets
+# - Hyperliquid perps & spot with robust USD pricing via USDC pair graph (midPx preferred)
+# - Combined Total metric (DeBank + HL spot, optional perps equity)
+# - Persists wallets/comments to shadow_nav_store.json
+# - Streamlit Secrets supported
 
 import os
 import json
@@ -367,7 +368,7 @@ class HyperliquidClient:
                     continue
                 a, b = pair["tokens"][0], pair["tokens"][1]
             else:
-                if len(pair) != 2: 
+                if len(pair) != 2:
                     continue
                 a, b = pair[0], pair[1]
             ctx = ctxs[i] if i < len(ctxs) else {}
@@ -648,7 +649,10 @@ if st:
                     st.session_state.comments.setdefault(addr, []).append({"ts": tstamp, "text": new_text.strip()})
                     save_store(st.session_state.wallets, st.session_state.comments, st.session_state.active_idx)
                     st.success("Saved.")
-                    do_rerun()
+                    try:
+                        st.rerun()
+                    except Exception:
+                        pass
                 else:
                     st.warning("Please type something before saving.")
 
@@ -660,7 +664,10 @@ if st:
             st.session_state.active_idx = None
         st.session_state.wallets.pop(to_delete_idx)
         save_store(st.session_state.wallets, st.session_state.comments, st.session_state.active_idx)
-        do_rerun()
+        try:
+            st.rerun()
+        except Exception:
+            pass
 
     selected_total_placeholder.metric("Selected Total Balance", fmt_usd(selected_total_value))
 
@@ -676,11 +683,17 @@ if st:
         header_cols[0].markdown(f"**{w['client']} — {w['label']}**  \n`{w['addr']}`")
         if header_cols[1].button("↻ Refresh", key="detail_refresh"):
             st.session_state.refresh_nonce = int(time.time())
-            do_rerun()
+            try:
+                st.rerun()
+            except Exception:
+                pass
         if header_cols[2].button("Clear Selection", key="detail_clear"):
             st.session_state.active_idx = None
             save_store(st.session_state.wallets, st.session_state.comments, st.session_state.active_idx)
-            do_rerun()
+            try:
+                st.rerun()
+            except Exception:
+                pass
 
         # Dollar Value (DeBank)
         total = {"total_usd_value": 0}
@@ -738,7 +751,7 @@ if st:
                     hl_spot_total = 0.0
                 st.caption(f"Spot total (from HL): {fmt_usd(hl_spot_total)}")
 
-            # Optional: explain price source for HYPE (and toggle for others)
+            # Optional: explain price source for HYPE
             with st.expander("Explain HYPE price source"):
                 for line in HyperliquidClient.explain_price_lines(spot_meta, "HYPE"):
                     st.caption(line)
@@ -754,4 +767,9 @@ if st:
                  + (" + HL perps equity" if include_hl and include_perps_in_total else "")
         )
 
-else:
+# ---- CLI hint if Streamlit isn't available ----
+if not st and __name__ == "__main__":
+    print("Install Streamlit and run:")
+    print("  pip install streamlit requests urllib3")
+    print("  export DEBANK_API_KEY='YOUR_ACCESSKEY'")
+    print("  streamlit run shadow_nav_board.py")
