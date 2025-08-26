@@ -1,8 +1,10 @@
 # shadow_nav_board.py
-# Shadow NAV board: single-page UI (board + selected wallet details below)
-# Now with per-wallet Comment Log (timestamped) beside every wallet.
+# Shadow NAV board — single-page UI with per-wallet comment log + persistence.
+# - Uses Streamlit Secrets when available (DEBANK_API_KEY / DEBANK_BASE_URL / DEBANK_HEADER_NAME)
+# - Persists wallets & comments to local JSON (shadow_nav_store.json) so they survive logout/reload
 
 import os
+import json
 import time
 import socket
 from datetime import datetime
@@ -13,6 +15,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 DEFAULT_BASE_URL = "https://pro-openapi.debank.com"
+STORE_PATH = os.environ.get("SHADOW_NAV_STORE", "shadow_nav_store.json")
+
+# ---------------- DeBank client ----------------
 
 class DebankError(Exception):
     pass
@@ -27,7 +32,7 @@ class DebankClient:
         max_retries: int = 3,
         backoff: float = 0.8,
         proxies: Optional[Dict[str, str]] = None,
-        user_agent: str = "shadow-nav/board/1.2",
+        user_agent: str = "shadow-nav/board/1.3",
     ) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.api_key = api_key or os.getenv("DEBANK_API_KEY")
@@ -49,6 +54,7 @@ class DebankClient:
         self.session.mount("http://", adapter)
         if proxies:
             self.session.proxies.update(proxies)
+
         self.user_agent = user_agent
 
     def _headers(self) -> Dict[str, str]:
@@ -106,14 +112,60 @@ except Exception:
     st = None
 
 if st:
-    st.set_page_config(page_title="Shadow NAV Board (One Page)", layout="wide")
+    st.set_page_config(page_title="Shadow NAV Board — One Page", layout="wide")
 
-    # Sidebar
+    # ---- Secrets/env config helpers ----
+    def cfg(name: str, default=None):
+        try:
+            val = st.secrets.get(name)  # Streamlit Secrets
+        except Exception:
+            val = None
+        if val is None:
+            val = os.getenv(name)       # Environment variable
+        return val if val is not None else default
+
+    api_key_default     = cfg("DEBANK_API_KEY", "")
+    header_name_default = cfg("DEBANK_HEADER_NAME", "AccessKey")
+    base_url_default    = cfg("DEBANK_BASE_URL", DEFAULT_BASE_URL)
+
+    have_api_key = bool(api_key_default)
+    have_header  = bool(header_name_default)
+    have_base    = bool(base_url_default)
+
+    # ---- Persistence helpers (wallets & comments) ----
+    def load_store() -> Dict[str, Any]:
+        try:
+            if os.path.exists(STORE_PATH):
+                with open(STORE_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {"wallets": [], "comments": {}, "active_idx": None}
+
+    def save_store(wallets: List[Dict[str, str]], comments: Dict[str, List[Dict[str, str]]], active_idx: Optional[int]):
+        try:
+            data = {"wallets": wallets, "comments": comments, "active_idx": active_idx}
+            with open(STORE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            st.warning(f"Could not save store: {e}")
+
+    # ---- Initial state (load persisted store ONCE) ----
+    if "store_loaded" not in st.session_state:
+        store = load_store()
+        st.session_state.wallets = store.get("wallets", [])
+        st.session_state.comments = store.get("comments", {})
+        st.session_state.active_idx = store.get("active_idx", None)
+        st.session_state.refresh_nonce = 0
+        st.session_state.store_loaded = True
+
+    # ---- Sidebar ----
     st.sidebar.header("Setup")
-    api_key = st.sidebar.text_input("DEBANK_API_KEY", value=os.getenv("DEBANK_API_KEY", ""), type="password")
-    base_url = st.sidebar.text_input("Base URL", value=os.getenv("DEBANK_BASE_URL", DEFAULT_BASE_URL))
-    header_name = st.sidebar.text_input("Header Name", value=os.getenv("DEBANK_HEADER_NAME", "AccessKey"))
-    show_debug = st.sidebar.toggle("Show debug tracebacks", value=False)
+    api_key    = st.sidebar.text_input("DEBANK_API_KEY", value=api_key_default, type="password", disabled=have_api_key)
+    header_name = st.sidebar.text_input("Header Name", value=header_name_default, disabled=have_header)
+    base_url    = st.sidebar.text_input("Base URL", value=base_url_default, disabled=have_base)
+    if have_api_key:
+        st.sidebar.success("Using DEBANK_API_KEY from secrets/env")
 
     st.sidebar.divider()
     st.sidebar.caption(
@@ -127,16 +179,7 @@ if st:
         placeholder="Darren, Darren #1, 0x123...\nDarren, Darren #2, 0xabc...\nAlice, Wallet A, 0x456...",
         height=140,
     )
-
-    # State
-    if "wallets" not in st.session_state:
-        st.session_state.wallets = []
-    if "active_idx" not in st.session_state:
-        st.session_state.active_idx = None
-    if "refresh_nonce" not in st.session_state:
-        st.session_state.refresh_nonce = 0
-    if "comments" not in st.session_state:
-        st.session_state.comments = {}  # addr -> list of {ts, text}
+    col_sb1, col_sb2 = st.sidebar.columns(2)
 
     def parse_wallets(text: str) -> List[Dict[str, str]]:
         items, i = [], 1
@@ -158,15 +201,20 @@ if st:
             i += 1
         return items
 
-    col_sb1, col_sb2 = st.sidebar.columns(2)
     if col_sb1.button("Load Wallets"):
         st.session_state.wallets = parse_wallets(wallets_text)
-        st.session_state.active_idx = None
+        # keep current selection if still valid, else clear
+        if st.session_state.active_idx is not None and st.session_state.active_idx >= len(st.session_state.wallets):
+            st.session_state.active_idx = None
+        save_store(st.session_state.wallets, st.session_state.comments, st.session_state.active_idx)
+
     if col_sb2.button("Clear All"):
         st.session_state.wallets = []
+        st.session_state.comments = {}
         st.session_state.active_idx = None
+        save_store(st.session_state.wallets, st.session_state.comments, st.session_state.active_idx)
 
-    # Build client
+    # ---- Build client ----
     def build_client() -> Optional[DebankClient]:
         if not api_key:
             st.error("Please provide DEBANK_API_KEY.")
@@ -175,24 +223,18 @@ if st:
             return DebankClient(api_key=api_key, base_url=base_url, header_name=header_name)
         except Exception as e:
             st.error(f"Client init failed: {e}")
-            if show_debug:
-                st.exception(e)
             return None
 
     api = build_client()
 
-    # Helpers
+    # ---- Helpers ----
     def safe_call(msg, fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
         except DebankError as e:
             st.error(f"{msg}: {e}")
-            if show_debug:
-                st.exception(e)
         except Exception as e:
             st.error(f"{msg}: Unexpected error: {e}")
-            if show_debug:
-                st.exception(e)
         return None
 
     def fmt_usd(v) -> str:
@@ -242,8 +284,8 @@ if st:
         rows.sort(key=lambda r: (r["USD Value"] or 0), reverse=True)
         return rows
 
-    # --------- PAGE: Board (top) + Selected Wallet Pane (bottom) ---------
-    st.title("Shadow NAV Board — One Page")
+    # --------- PAGE: Board (top) + Selected Wallet (bottom) ---------
+    st.title("Shadow NAV Board — One Page (Persisted)")
 
     if not st.session_state.wallets:
         st.info("Add wallets in the sidebar and click **Load Wallets**.")
@@ -255,13 +297,13 @@ if st:
     c1, c2, c3 = st.columns([1,1,3])
     if c1.button("Refresh balances"):
         st.session_state.refresh_nonce = int(time.time())
+        # no data cleared; balances re-fetched on next render
 
     selected_total_placeholder = c2.empty()
     selected_total_value = 0.0
 
     # Board list
     st.markdown("### Wallets")
-    # Added a "Comments" column before Delete
     hdr = st.columns([2, 3, 4, 2, 1, 2, 1])
     hdr[0].markdown("**Client**")
     hdr[1].markdown("**Wallet**")
@@ -282,8 +324,10 @@ if st:
         # Clicking label or address selects the wallet (details shown below)
         if cols[1].button(w["label"], key=f"open_label_{idx}"):
             st.session_state.active_idx = idx
+            save_store(st.session_state.wallets, st.session_state.comments, st.session_state.active_idx)
         if cols[2].button(w["addr"], key=f"open_addr_{idx}"):
             st.session_state.active_idx = idx
+            save_store(st.session_state.wallets, st.session_state.comments, st.session_state.active_idx)
 
         total = {"total_usd_value": None}
         if api:
@@ -297,10 +341,9 @@ if st:
             except Exception:
                 pass
 
-        # ----- Per-wallet Comment Log (timestamped) -----
+        # ----- Per-wallet Comment Log (timestamped, persisted) -----
         with cols[5].expander("💬 Log", expanded=False):
             addr = w["addr"]
-            # show last 5 comments (most recent first)
             log = st.session_state.comments.get(addr, [])
             if log:
                 for entry in reversed(log[-5:]):
@@ -312,8 +355,9 @@ if st:
                 tstamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
                 if new_text.strip():
                     st.session_state.comments.setdefault(addr, []).append({"ts": tstamp, "text": new_text.strip()})
+                    save_store(st.session_state.wallets, st.session_state.comments, st.session_state.active_idx)
                     st.success("Saved.")
-                    st.rerun()
+                    st.experimental_rerun()
                 else:
                     st.warning("Please type something before saving.")
 
@@ -321,10 +365,13 @@ if st:
             to_delete_idx = idx
 
     if to_delete_idx is not None:
+        # Adjust active selection if we delete the selected row
         if st.session_state.active_idx == to_delete_idx:
             st.session_state.active_idx = None
+        # Remove and persist
         st.session_state.wallets.pop(to_delete_idx)
-        st.rerun()
+        save_store(st.session_state.wallets, st.session_state.comments, st.session_state.active_idx)
+        st.experimental_rerun()
 
     selected_total_placeholder.metric("Selected Total Balance", fmt_usd(selected_total_value))
 
@@ -340,10 +387,11 @@ if st:
         header_cols[0].markdown(f"**{w['client']} — {w['label']}**  \n`{w['addr']}`")
         if header_cols[1].button("↻ Refresh", key="detail_refresh"):
             st.session_state.refresh_nonce = int(time.time())
-            st.rerun()
+            st.experimental_rerun()
         if header_cols[2].button("Clear Selection", key="detail_clear"):
             st.session_state.active_idx = None
-            st.rerun()
+            save_store(st.session_state.wallets, st.session_state.comments, st.session_state.active_idx)
+            st.experimental_rerun()
 
         # Dollar Value
         total = {"total_usd_value": 0}
@@ -358,15 +406,11 @@ if st:
             st.markdown("**DeFi Positions**")
             positions = safe_call("DeFi positions", api.get_complex_protocol_list, w["addr"]) or []
             st.dataframe(position_rows(positions), use_container_width=True)
-            if show_debug:
-                st.caption("Debug sample:"); st.json((positions or [])[:1])
 
         with d2:
             st.markdown("**Token Holdings**")
             tokens = safe_call("Coins in wallet", api.get_all_token_list, w["addr"], True) or []
             st.dataframe(token_rows(tokens)[:25], use_container_width=True)
-            if show_debug:
-                st.caption("Debug sample:"); st.json((tokens or [])[:1])
 
 else:
     if __name__ == "__main__":
