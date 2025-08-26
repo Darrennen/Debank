@@ -220,6 +220,51 @@ if st:
         except Exception:
             return "-"
 
+    def position_rows(positions):
+    rows = []
+    for p in positions or []:
+        usd = p.get("usd_value")
+        if usd is None:
+            total = 0.0
+            for it in p.get("portfolio_item_list", []) or []:
+                stats = (it or {}).get("stats") or {}
+                v = stats.get("net_usd_value") or stats.get("usd_value") or stats.get("asset_usd_value") or 0
+                try:
+                    total += float(v)
+                except Exception:
+                    pass
+            usd = total
+        rows.append({
+            "Protocol": p.get("name") or p.get("id"),
+            "Chain": p.get("chain"),
+            "USD Value": usd,
+            "TVL": p.get("tvl"),
+            "Site": p.get("site_url"),
+        })
+    rows.sort(key=lambda r: (r["USD Value"] or 0), reverse=True)
+    return rows
+
+def token_rows(tokens):
+    rows = []
+    for t in tokens or []:
+        usd = t.get("usd_value")
+        if usd is None:
+            try:
+                usd = float(t.get("price") or 0) * float(t.get("amount") or 0)
+            except Exception:
+                usd = 0.0
+        rows.append({
+            "Token": t.get("display_symbol") or t.get("symbol") or t.get("name"),
+            "Chain": t.get("chain"),
+            "Amount": t.get("amount"),
+            "Price": t.get("price"),
+            "USD Value": usd,
+            "Protocol": t.get("protocol_id") or "",
+        })
+    rows.sort(key=lambda r: (r["USD Value"] or 0), reverse=True)
+    return rows
+
+
     # ------------- Views -------------
     st.title("Shadow NAV Board")
 
