@@ -1,7 +1,7 @@
 # shadow_nav_board.py
-# Shadow NAV board — one-page UI with per-wallet comment log + persistence + Hyperliquid USD pricing fix.
-# - DeBank for on-chain EVM
-# - Hyperliquid perps & spot, with correct spot USD pricing via spotMetaAndAssetCtxs (USDC pairs)
+# Shadow NAV board — one-page UI with per-wallet comment log + persistence + Hyperliquid price fix.
+# - DeBank for on-chain (EVM) assets
+# - Hyperliquid perps & spot with robust USD pricing via USDC pair graph
 # - Persists wallets/comments to shadow_nav_store.json
 # - Streamlit Secrets supported
 
@@ -20,7 +20,6 @@ DEFAULT_BASE_URL = "https://pro-openapi.debank.com"
 STORE_PATH = os.environ.get("SHADOW_NAV_STORE", "shadow_nav_store.json")
 
 # ---------------- DeBank client ----------------
-
 class DebankError(Exception):
     pass
 
@@ -34,7 +33,7 @@ class DebankClient:
         max_retries: int = 3,
         backoff: float = 0.8,
         proxies: Optional[Dict[str, str]] = None,
-        user_agent: str = "shadow-nav/board/1.6",
+        user_agent: str = "shadow-nav/board/1.7",
     ) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.api_key = api_key or os.getenv("DEBANK_API_KEY")
@@ -105,8 +104,8 @@ class DebankClient:
     def get_complex_protocol_list(self, addr: str) -> List[Dict[str, Any]]:
         return self._get("/v1/user/all_complex_protocol_list", {"id": addr})
 
-# ---------------- Hyperliquid client (read-only) ----------------
 
+# ---------------- Hyperliquid client (read-only) ----------------
 class HyperliquidError(Exception):
     pass
 
@@ -157,92 +156,121 @@ class HyperliquidClient:
 
     # ---------- helpers ----------
     @staticmethod
-    def _extract_token_index_map(spot_meta: Dict[str, Any]) -> Dict[int, str]:
+    def _extract_token_maps(spot_meta: Dict[str, Any]) -> Dict[str, Dict[int, Any]]:
         """
-        From spotMetaAndAssetCtxs payload: map token index -> token name.
+        From spotMetaAndAssetCtxs payload:
+          - idx_to_name: token index -> token name (e.g., 150 -> "HYPE")
+          - idx_to_dec:  token index -> decimals (if provided; else None)
         """
-        token_map: Dict[int, str] = {}
+        idx_to_name: Dict[int, str] = {}
+        idx_to_dec: Dict[int, Optional[int]] = {}
         try:
             if isinstance(spot_meta, list) and len(spot_meta) >= 1:
                 meta = spot_meta[0] or {}
                 for t in meta.get("tokens", []) or []:
                     idx = t.get("index")
                     name = t.get("name")
+                    dec = t.get("szDecimals") or t.get("decimals")
                     if isinstance(idx, int) and name:
-                        token_map[idx] = name
+                        idx_to_name[idx] = name
+                        try:
+                            idx_to_dec[idx] = int(dec) if dec is not None else None
+                        except Exception:
+                            idx_to_dec[idx] = None
         except Exception:
             pass
-        return token_map
+        return {"idx_to_name": idx_to_name, "idx_to_dec": idx_to_dec}
+
+    @staticmethod
+    def _build_spot_price_map(spot_meta: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Build USD prices via a graph anchored at USDC=1 using universe pairs.
+        For pair [baseIdx, quoteIdx] with price p:  price(base) = p * price(quote)
+        """
+        prices: Dict[int, float] = {}
+        name_of: Dict[int, str] = {}
+
+        if not (isinstance(spot_meta, list) and len(spot_meta) >= 2):
+            return {}
+
+        meta, ctxs = spot_meta[0] or {}, spot_meta[1] or []
+        tokens = meta.get("tokens", []) or []
+        universe = meta.get("universe", []) or []
+
+        for t in tokens:
+            idx = t.get("index")
+            name = t.get("name")
+            if isinstance(idx, int) and isinstance(name, str):
+                name_of[idx] = name
+
+        # anchor all tokens named "USDC" as 1.0
+        usdc_indices = [i for i, n in name_of.items() if n.upper() == "USDC"]
+        for ui in usdc_indices:
+            prices[ui] = 1.0
+
+        # edges: list of (baseIdx, quoteIdx, px)
+        edges: List[tuple] = []
+        for i, pair in enumerate(universe):
+            base_idx, quote_idx = None, None
+            if isinstance(pair, dict) and isinstance(pair.get("tokens"), list) and len(pair["tokens"]) == 2:
+                base_idx, quote_idx = pair["tokens"][0], pair["tokens"][1]
+            elif isinstance(pair, list) and len(pair) == 2:
+                base_idx, quote_idx = pair[0], pair[1]
+            if base_idx is None or quote_idx is None:
+                continue
+            ctx = ctxs[i] if i < len(ctxs) else {}
+            px = ctx.get("markPx") or ctx.get("midPx") or ctx.get("prevDayPx")
+            try:
+                px = float(px)
+            except Exception:
+                px = None
+            if px is None or px <= 0:
+                continue
+            edges.append((int(base_idx), int(quote_idx), px))
+
+        # Relaxation pass: propagate prices until stable
+        changed = True
+        iters = 0
+        while changed and iters < 8:  # small cap
+            changed = False
+            iters += 1
+            for a, b, p in edges:
+                pa = prices.get(a)
+                pb = prices.get(b)
+                if pb is not None and pa is None:
+                    prices[a] = p * pb
+                    changed = True
+                elif pa is not None and pb is None:
+                    if p != 0:
+                        prices[b] = pa / p
+                        changed = True
+
+        # Map to names
+        out: Dict[str, float] = {}
+        for idx, val in prices.items():
+            nm = name_of.get(idx)
+            if nm and isinstance(val, (int, float)) and val > 0:
+                out[nm] = float(val)
+
+        return out
 
     @staticmethod
     def _build_price_map(perp_meta: Dict[str, Any], spot_meta: Dict[str, Any]) -> Dict[str, float]:
         """
-        Aggregate USD prices for coins:
-        - Perps: take markPx/oracle/index by coin name
-        - Spot: derive coin prices via universe pairs vs USDC from spotMetaAndAssetCtxs
+        Merge: start with SPOT (USDC graph) → fill missing from PERP marks.
         """
-        mp: Dict[str, float] = {}
+        mp = HyperliquidClient._build_spot_price_map(spot_meta)
 
-        # Perp meta: often includes assetCtxs with 'name' and 'markPx'
         try:
             asset_ctxs = (perp_meta or {}).get("assetCtxs") or []
             for ctx in asset_ctxs:
                 coin = ctx.get("name") or ctx.get("coin")
                 price = ctx.get("markPx") or ctx.get("oraclePx") or ctx.get("indexPx")
-                if coin and price is not None:
+                if coin and price is not None and coin not in mp:
                     try:
                         mp[coin] = float(price)
                     except Exception:
                         pass
-        except Exception:
-            pass
-
-        # Spot meta: [meta, assetCtxs]; map by USDC pairs
-        try:
-            if isinstance(spot_meta, list) and len(spot_meta) >= 2:
-                meta = spot_meta[0] or {}
-                ctxs = spot_meta[1] or []
-                tokens = meta.get("tokens", []) or []
-                universe = meta.get("universe", []) or []
-
-                # token index -> name
-                idx_to_name = {t.get("index"): t.get("name") for t in tokens if t.get("name") is not None}
-                # find USDC index
-                usdc_idx_candidates = [idx for idx, name in idx_to_name.items() if str(name).upper() == "USDC"]
-                usdc_idx = usdc_idx_candidates[0] if usdc_idx_candidates else None
-
-                for i, pair in enumerate(universe):
-                    base_idx, quote_idx = None, None
-                    if isinstance(pair, dict) and isinstance(pair.get("tokens"), list) and len(pair["tokens"]) == 2:
-                        base_idx, quote_idx = pair["tokens"][0], pair["tokens"][1]
-                    elif isinstance(pair, list) and len(pair) == 2:
-                        base_idx, quote_idx = pair[0], pair[1]
-
-                    if base_idx is None or quote_idx is None:
-                        continue
-
-                    ctx = ctxs[i] if i < len(ctxs) else {}
-                    px = ctx.get("markPx") or ctx.get("midPx") or ctx.get("prevDayPx")
-                    try:
-                        px = float(px)
-                    except Exception:
-                        px = None
-                    if px is None or px <= 0:
-                        continue
-
-                    base_name = idx_to_name.get(base_idx)
-                    quote_name = idx_to_name.get(quote_idx)
-
-                    # If pair is BASE/USDC, price(BASE)=px
-                    if usdc_idx is not None and quote_idx == usdc_idx and base_name:
-                        mp.setdefault(base_name, px)
-                    # If pair is USDC/QUOTE, price(QUOTE)=1/px
-                    if usdc_idx is not None and base_idx == usdc_idx and quote_name:
-                        try:
-                            inv = 1.0 / px
-                            mp.setdefault(quote_name, inv)
-                        except ZeroDivisionError:
-                            pass
         except Exception:
             pass
 
@@ -306,18 +334,17 @@ class HyperliquidClient:
         return rows
 
     @staticmethod
-    def spot_rows(state: Dict[str, Any], price_map: Dict[str, float], token_index_map: Optional[Dict[int, str]] = None) -> List[Dict[str, Any]]:
+    def spot_rows(state: Dict[str, Any], price_map: Dict[str, float], idx_to_name: Optional[Dict[int, str]] = None) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         balances = state.get("balances") or state.get("assetPositions") or []
 
         for b in balances:
             coin = b.get("coin") or b.get("symbol")
-            if not coin and token_index_map is not None and "token" in b:
-                # map token index -> coin name (e.g., 150 -> "HYPE")
+            if not coin and idx_to_name is not None and "token" in b:
                 try:
-                    coin = token_index_map.get(int(b.get("token")))
+                    coin = idx_to_name.get(int(b.get("token")))
                 except Exception:
-                    coin = coin  # leave as-is
+                    pass
 
             amt  = b.get("total") or b.get("size") or b.get("amount") or (b.get("position") or {}).get("szi")
             try:
@@ -325,10 +352,9 @@ class HyperliquidClient:
             except Exception:
                 amount = 0.0
 
-            # Try embedded px; else from price_map built from USDC pairs
             px = b.get("markPx") or b.get("oraclePx")
             if px is None and coin:
-                px = price_map.get(coin)
+                px = price_map.get(str(coin))
             try:
                 price = float(px) if px is not None else None
             except Exception:
@@ -339,6 +365,7 @@ class HyperliquidClient:
 
         rows.sort(key=lambda r: abs(r.get("USD Value") or 0), reverse=True)
         return rows
+
 
 # ---------------- Streamlit UI ----------------
 try:
@@ -651,7 +678,7 @@ if st:
             tokens = safe_call("Coins in wallet", api.get_all_token_list, w["addr"], True) or []
             st.dataframe(token_rows(tokens)[:25], use_container_width=True)
 
-        # Hyperliquid
+        # Hyperliquid (with correct USD pricing)
         if include_hl:
             st.markdown("#### Hyperliquid")
             hl_client = hl or HyperliquidClient()
@@ -661,8 +688,10 @@ if st:
             perp_meta  = safe_call("Hyperliquid perp meta", hl_client.get_perp_meta) or {}
             spot_meta  = safe_call("Hyperliquid spot meta", hl_client.get_spot_meta) or {}
 
+            # Price map from SPOT USDC graph + PERP fallback
             price_map  = HyperliquidClient._build_price_map(perp_meta, spot_meta)
-            token_idx_map = HyperliquidClient._extract_token_index_map(spot_meta)
+            maps = HyperliquidClient._extract_token_maps(spot_meta)
+            idx_to_name = maps["idx_to_name"]
 
             h1, h2 = st.columns(2)
             with h1:
@@ -671,7 +700,7 @@ if st:
                 st.dataframe(perp_rows, use_container_width=True)
             with h2:
                 st.markdown("**Spot**")
-                spot_rows = HyperliquidClient.spot_rows(spot_state, price_map, token_idx_map)
+                spot_rows = HyperliquidClient.spot_rows(spot_state, price_map, idx_to_name)
                 st.dataframe(spot_rows, use_container_width=True)
 
 else:
