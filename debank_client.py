@@ -1,5 +1,13 @@
 # shadow_nav_min.py
-# Minimal DeBank Pro OpenAPI viewer: Coins in Wallet + DeFi Positions per wallet.
+# Minimal DeBank Pro OpenAPI viewer:
+# - Total Balance (+ top-5 chain breakdown)
+# - Coins in Wallet (all chains)
+# - DeFi Positions (all chains)
+#
+# Run:
+#   pip install streamlit requests urllib3
+#   export DEBANK_API_KEY="YOUR_ACCESSKEY"
+#   streamlit run shadow_nav_min.py
 
 import os
 import socket
@@ -26,7 +34,7 @@ class DebankClient:
         max_retries: int = 3,
         backoff: float = 0.8,
         proxies: Optional[Dict[str, str]] = None,
-        user_agent: str = "shadow-nav/mini/1.0",
+        user_agent: str = "shadow-nav/mini/1.1",
     ) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.api_key = api_key or os.getenv("DEBANK_API_KEY")
@@ -89,6 +97,9 @@ class DebankClient:
         return data["data"] if isinstance(data, dict) and "data" in data else data
 
     # ---- endpoints used in this mini app ----
+    def get_total_balance(self, addr: str) -> Dict[str, Any]:
+        return self._get("/v1/user/total_balance", {"id": addr})
+
     def get_all_token_list(self, addr: str, is_all: bool = True) -> List[Dict[str, Any]]:
         return self._get("/v1/user/all_token_list", {"id": addr, "is_all": str(is_all).lower()})
 
@@ -116,8 +127,7 @@ if st:
     wallets_text = st.sidebar.text_area("Wallets", placeholder="Wallet 1, 0x123...\nWallet 2, 0xabc...\n0xdef... (auto-labeled)")
     go = st.sidebar.button("Load")
 
-    st.title("Shadow NAV – Coins & DeFi (Minimal)")
-    st.caption("Shows only Coins in Wallet and DeFi Positions for multiple wallets.")
+    st.title("Shadow NAV – Total, Coins & DeFi (Minimal)")
 
     def parse_wallets(text: str) -> List[Dict[str, str]]:
         items = []
@@ -173,15 +183,24 @@ if st:
             st.warning("Add at least one wallet.")
             st.stop()
 
-        # Layout: one section per wallet (Wallet 1, Wallet 2, Wallet 3, ...)
         for w in wallets:
             st.markdown(f"## {w['label']}")
+
+            # ---- Total Balance + top-5 chains ----
+            total = safe_call(f"{w['label']} total balance", api.get_total_balance, w["addr"]) or {}
+            if total:
+                total_usd = total.get("total_usd_value") or total.get("usd_value") or 0
+                st.metric("Total Balance (USD)", f"{float(total_usd):,.2f}")
+                chains = sorted(total.get("chain_list", []), key=lambda c: c.get("usd_value", 0), reverse=True)
+                top5 = [{"chain": (c.get("name") or c.get("id")), "usd_value": c.get("usd_value")} for c in chains[:5]]
+                st.json(top5)
+
             col1, col2 = st.columns(2)
 
             with col1:
                 st.markdown("**Coins in Wallet (all chains)**")
                 tokens = safe_call(f"{w['label']} tokens", api.get_all_token_list, w["addr"], True) or []
-                # Keep compact: show top 20 by USD value (if present), else as-is
+
                 def token_usd(t):
                     if isinstance(t, dict):
                         if "usd_value" in t and isinstance(t["usd_value"], (int, float)):
@@ -193,14 +212,13 @@ if st:
                         except Exception:
                             return 0.0
                     return 0.0
+
                 tokens_sorted = sorted(tokens, key=token_usd, reverse=True)
                 st.json(tokens_sorted[:20])
 
             with col2:
                 st.markdown("**DeFi Positions (all chains, cached)**")
                 positions = safe_call(f"{w['label']} positions", api.get_complex_protocol_list, w["addr"]) or []
-                # Keep compact: show only protocol-level summary (first 15)
-                # If response is very verbose, we just slice the list.
                 st.json(positions[:15])
 
 else:
