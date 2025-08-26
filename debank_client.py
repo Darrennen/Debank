@@ -14,7 +14,7 @@ from urllib3.util.retry import Retry
 # Debank client (v2)
 # ------------------------------
 
-DEFAULT_BASE_URL = "https://api.cloud.debank.com"
+DEFAULT_BASE_URL = "https://openapi.debank.com"
 
 class DebankError(Exception):
     pass
