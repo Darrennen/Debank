@@ -112,7 +112,7 @@ except Exception:
     st = None
 
 if st:
-    st.set_page_config(page_title="Shadow NAV Board — One Page", layout="wide")
+    st.set_page_config(page_title="Client Dashboard", layout="wide")
 
     # ---- Secrets/env config helpers ----
     def cfg(name: str, default=None):
