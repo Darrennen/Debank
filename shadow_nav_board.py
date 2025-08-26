@@ -1,9 +1,11 @@
 # shadow_nav_board.py
 # Shadow NAV board: single-page UI (board + selected wallet details below)
+# Now with per-wallet Comment Log (timestamped) beside every wallet.
 
 import os
 import time
 import socket
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -25,7 +27,7 @@ class DebankClient:
         max_retries: int = 3,
         backoff: float = 0.8,
         proxies: Optional[Dict[str, str]] = None,
-        user_agent: str = "shadow-nav/board/1.1",
+        user_agent: str = "shadow-nav/board/1.2",
     ) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.api_key = api_key or os.getenv("DEBANK_API_KEY")
@@ -133,6 +135,8 @@ if st:
         st.session_state.active_idx = None
     if "refresh_nonce" not in st.session_state:
         st.session_state.refresh_nonce = 0
+    if "comments" not in st.session_state:
+        st.session_state.comments = {}  # addr -> list of {ts, text}
 
     def parse_wallets(text: str) -> List[Dict[str, str]]:
         items, i = [], 1
@@ -257,23 +261,25 @@ if st:
 
     # Board list
     st.markdown("### Wallets")
-    hdr = st.columns([2, 3, 4, 2, 1, 1])
+    # Added a "Comments" column before Delete
+    hdr = st.columns([2, 3, 4, 2, 1, 2, 1])
     hdr[0].markdown("**Client**")
     hdr[1].markdown("**Wallet**")
     hdr[2].markdown("**Address**")
     hdr[3].markdown("**Dollar Value**")
     hdr[4].markdown("**Select**")
-    hdr[5].markdown("**Delete**")
+    hdr[5].markdown("**Comments**")
+    hdr[6].markdown("**Delete**")
 
     to_delete_idx = None
     for idx, w in enumerate(st.session_state.wallets):
         if w["client"] not in sel_clients:
             continue
 
-        cols = st.columns([2, 3, 4, 2, 1, 1])
+        cols = st.columns([2, 3, 4, 2, 1, 2, 1])
         cols[0].write(w["client"])
 
-        # Clicking either the label or the address selects the wallet
+        # Clicking label or address selects the wallet (details shown below)
         if cols[1].button(w["label"], key=f"open_label_{idx}"):
             st.session_state.active_idx = idx
         if cols[2].button(w["addr"], key=f"open_addr_{idx}"):
@@ -291,11 +297,30 @@ if st:
             except Exception:
                 pass
 
-        if cols[5].button("🗑", key=f"del_{idx}"):
+        # ----- Per-wallet Comment Log (timestamped) -----
+        with cols[5].expander("💬 Log", expanded=False):
+            addr = w["addr"]
+            # show last 5 comments (most recent first)
+            log = st.session_state.comments.get(addr, [])
+            if log:
+                for entry in reversed(log[-5:]):
+                    st.write(f"- *{entry['ts']}*: {entry['text']}")
+            else:
+                st.caption("No comments yet.")
+            new_text = st.text_input("Add a comment", key=f"cmt_input_{idx}", placeholder="e.g., Moved funds to Aave")
+            if st.button("Save", key=f"cmt_save_{idx}"):
+                tstamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                if new_text.strip():
+                    st.session_state.comments.setdefault(addr, []).append({"ts": tstamp, "text": new_text.strip()})
+                    st.success("Saved.")
+                    st.rerun()
+                else:
+                    st.warning("Please type something before saving.")
+
+        if cols[6].button("🗑", key=f"del_{idx}"):
             to_delete_idx = idx
 
     if to_delete_idx is not None:
-        # Clear selection if we delete the selected row
         if st.session_state.active_idx == to_delete_idx:
             st.session_state.active_idx = None
         st.session_state.wallets.pop(to_delete_idx)
