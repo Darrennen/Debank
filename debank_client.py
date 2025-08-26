@@ -1,13 +1,18 @@
-# debank_client_v2.py
-# Drop-in replacement for DebankClient with stronger retries and clearer errors.
+# shadow_nav_app.py
+# DebankClient (with robust retries + DNS diagnostics) + Streamlit UI in ONE file
 
 import os
 import time
 import socket
 from typing import Any, Dict, List, Optional
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# ------------------------------
+# Debank client (v2)
+# ------------------------------
 
 DEFAULT_BASE_URL = "https://api.cloud.debank.com"
 
@@ -166,3 +171,147 @@ class DebankClient:
             "chains": chains,
             "positions": positions,
         }
+
+
+# ------------------------------
+# Streamlit UI
+# ------------------------------
+try:
+    import streamlit as st
+except Exception:
+    # If streamlit isn't installed, just skip UI import errors
+    st = None
+
+if st:
+    st.set_page_config(page_title="Shadow NAV x DeBank (One-File App)", layout="wide")
+
+    st.sidebar.header("Setup")
+    default_key = os.getenv("DEBANK_API_KEY", "")
+    api_key = st.sidebar.text_input("DEBANK_API_KEY", value=default_key, type="password")
+    header_name = st.sidebar.text_input("Header Name", value=os.getenv("DEBANK_HEADER_NAME", "AccessKey"))
+    base_url = st.sidebar.text_input("Base URL", value=os.getenv("DEBANK_BASE_URL", DEFAULT_BASE_URL))
+
+    st.sidebar.caption("If you're on the FREE tier, try: https://openapi.debank.com (limited endpoints)")
+    show_debug = st.sidebar.toggle("Show debug tracebacks", value=False)
+
+    st.sidebar.divider()
+    addrs = st.sidebar.text_area("Wallet addresses (one per line)", placeholder="0x123...\n0xabc...")
+    go = st.sidebar.button("Fetch")
+
+    st.title("Shadow NAV Board – DeBank Pro API Demo (Single File)")
+    st.caption("Wired to the endpoints your UI needs. DNS/auth errors are shown clearly.")
+
+    def safe_call(label: str, fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except DebankError as e:
+            st.error(f"{label}: {e}")
+            if show_debug:
+                st.exception(e)
+            return None
+        except Exception as e:
+            st.error(f"{label}: Unexpected error: {e}")
+            if show_debug:
+                st.exception(e)
+            return None
+
+    if go:
+        if not api_key:
+            st.error("Please provide DEBANK_API_KEY (in env or sidebar).")
+            st.stop()
+
+        # Build client (and surface DNS/auth errors early)
+        api = None
+        try:
+            api = DebankClient(api_key=api_key, header_name=header_name, base_url=base_url)
+        except Exception as e:
+            st.error(f"Client init failed: {e}")
+            if show_debug:
+                st.exception(e)
+            st.stop()
+
+        addresses = [a.strip() for a in addrs.splitlines() if a.strip()]
+        if not addresses:
+            st.warning("Enter at least one address.")
+            st.stop()
+
+        tabs = st.tabs(["Overview", "Per Wallet", "Approvals", "Activity", "Curves"])
+
+        # ------------- Overview -------------
+        with tabs[0]:
+            st.subheader("Multi-wallet Overview")
+            rows = []
+            for addr in addresses:
+                summary = safe_call("summarize_wallet", api.summarize_wallet, addr) or {}
+                rows.append({
+                    "address": addr,
+                    "total_usd": summary.get("total_usd"),
+                    "chains": len(summary.get("chains") or []),
+                    "positions": len(summary.get("positions") or []),
+                })
+            st.dataframe(rows, use_container_width=True)
+
+        # ------------- Per Wallet -------------
+        with tabs[1]:
+            st.subheader("Single Wallet Detail")
+            if addresses:
+                addr = st.selectbox("Select wallet", options=addresses)
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Total Balance (USD)**")
+                    st.json(safe_call("get_total_balance", api.get_total_balance, addr))
+                    st.markdown("**Used Chains**")
+                    chains = safe_call("get_used_chains", api.get_used_chains, addr)
+                    st.json(chains)
+                with col2:
+                    st.markdown("**DeFi Positions (cached across chains)**")
+                    positions = safe_call("get_complex_protocol_list", api.get_complex_protocol_list, addr)
+                    st.json((positions or [])[:5])
+                    st.caption("Tip: On protocol row click, call get_protocol_detail(addr, protocol_id) for fresh drilldown.")
+
+                st.markdown("---")
+                st.markdown("**Coins in Wallet (all chains)**")
+                tokens = safe_call("get_all_token_list", api.get_all_token_list, addr, True)
+                st.json((tokens or [])[:25])
+
+        # ------------- Approvals -------------
+        with tabs[2]:
+            st.subheader("Approvals / Allowances")
+            if addresses:
+                addr = st.selectbox("Select wallet for approvals", options=addresses, key="appr_addr")
+                chain_id = st.text_input("Chain ID (e.g., eth, op, arb, bsc, polygon)", value="eth")
+                if st.button("Load Approvals"):
+                    st.markdown("**Token approvals**")
+                    st.json(safe_call("get_token_approvals", api.get_token_approvals, addr, chain_id))
+                    st.markdown("**NFT approvals**")
+                    st.json(safe_call("get_nft_approvals", api.get_nft_approvals, addr, chain_id))
+
+        # ------------- Activity -------------
+        with tabs[3]:
+            st.subheader("History / Activity")
+            if addresses:
+                addr = st.selectbox("Select wallet for history", options=addresses, key="hist_addr")
+                chain_id = st.text_input("Chain ID", value="eth", key="hist_chain")
+                st.caption("Use start_time (unix seconds) for pagination if needed.")
+                if st.button("Load History"):
+                    st.json(safe_call("get_history_list", api.get_history_list, addr, chain_id, page_count=50))
+
+        # ------------- Curves -------------
+        with tabs[4]:
+            st.subheader("Curves (sparklines)")
+            if addresses:
+                addr = st.selectbox("Select wallet for curves", options=addresses, key="curve_addr")
+                chain_id = st.text_input("Chain ID", value="eth", key="curve_chain")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Total Net Curve**")
+                    st.json((safe_call("get_total_net_curve", api.get_total_net_curve, addr) or [])[:30])
+                with col2:
+                    st.markdown("**Chain Net Curve**")
+                    st.json((safe_call("get_chain_net_curve", api.get_chain_net_curve, addr, chain_id) or [])[:30])
+
+else:
+    # If Streamlit isn't available, give a tiny tip when someone runs it as a plain script.
+    if __name__ == "__main__":
+        print("Streamlit is not installed. Install it with `pip install streamlit` and run:")
+        print("  streamlit run shadow_nav_app.py")
