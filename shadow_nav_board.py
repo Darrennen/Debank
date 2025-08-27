@@ -1,8 +1,8 @@
 # shadow_nav_board.py
 # Shadow NAV board — one-page UI with per-wallet comment log + persistence + Hyperliquid price options.
 # - DeBank (Pro OpenAPI) for on-chain EVM assets: total balance, token list, DeFi positions
-# - Hyperliquid REST + optional WebSocket for HYPE live price
-# - Optional "link HYPE price to HYPEEVM (DeBank)" override
+# - Hyperliquid REST states + optional WebSocket "allMids" for live prices (HYPE and others)
+# - Optional "link HYPE price to HYPEEVM (DeBank)" override (takes precedence)
 # - Persists wallets/comments/selection to shadow_nav_store.json
 # - Uses Streamlit secrets/env for DEBANK_API_KEY so you aren't prompted each time
 #
@@ -39,7 +39,7 @@ class DebankClient:
         max_retries: int = 3,
         backoff: float = 0.8,
         proxies: Optional[Dict[str, str]] = None,
-        user_agent: str = "shadow-nav/board/1.8",
+        user_agent: str = "shadow-nav/board/2.0",
     ) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.api_key = api_key or os.getenv("DEBANK_API_KEY")
@@ -116,7 +116,7 @@ class DebankClient:
         return self._get("/v1/token", {"chain_id": chain_id, "id": token_addr})
 
 
-# ---------------- Hyperliquid client (REST) ----------------
+# ---------------- Hyperliquid client (REST states) ----------------
 class HyperliquidError(Exception):
     pass
 
@@ -151,113 +151,16 @@ class HyperliquidClient:
         except Exception as e:
             raise HyperliquidError(f"Bad JSON from HL info: {e}") from e
 
-    # API wrappers
+    # API wrappers (no meta calls needed now)
     def get_perp_state(self, addr: str) -> Dict[str, Any]:
         return self._post({"type": "clearinghouseState", "user": addr})
 
     def get_spot_state(self, addr: str) -> Dict[str, Any]:
         return self._post({"type": "spotClearinghouseState", "user": addr})
 
-    def get_perp_meta(self) -> Dict[str, Any]:
-        return self._post({"type": "metaAndAssetCtxs"})
-
-    def get_spot_meta(self) -> Dict[str, Any]:
-        # returns [spotMeta, spotAssetCtxs]
-        return self._post({"type": "spotMetaAndAssetCtxs"})
-
-    # ---------- helpers ----------
+    # ---------- row builders; price is injected by a getter ----------
     @staticmethod
-    def _build_spot_price_map(spot_meta: Dict[str, Any]) -> Dict[str, float]:
-        """Build USD prices via USDC-anchored graph; prefer midPx, then markPx, then prevDayPx."""
-        prices: Dict[int, float] = {}
-        name_of: Dict[int, str] = {}
-
-        if not (isinstance(spot_meta, list) and len(spot_meta) >= 2):
-            return {}
-
-        meta, ctxs = spot_meta[0] or {}, spot_meta[1] or []
-        tokens = meta.get("tokens", []) or []
-        universe = meta.get("universe", []) or []
-
-        for t in tokens:
-            idx = t.get("index")
-            name = t.get("name")
-            if isinstance(idx, int) and isinstance(name, str):
-                name_of[idx] = name
-
-        # anchor strictly "USDC" to 1.0
-        for i, n in name_of.items():
-            if isinstance(n, str) and n.upper() == "USDC":
-                prices[i] = 1.0
-
-        edges: List[tuple] = []
-        for i, pair in enumerate(universe):
-            if isinstance(pair, dict):
-                toks = pair.get("tokens", [])
-                if not isinstance(toks, list) or len(toks) != 2:
-                    continue
-                a, b = toks[0], toks[1]
-            else:
-                if not isinstance(pair, list) or len(pair) != 2:
-                    continue
-                a, b = pair[0], pair[1]
-
-            ctx = ctxs[i] if i < len(ctxs) else {}
-            px = None
-            for field in ("midPx", "markPx", "prevDayPx"):
-                if ctx.get(field) is not None:
-                    try:
-                        px = float(ctx[field])
-                    except Exception:
-                        px = None
-                    if px and px > 0:
-                        break
-            if not px:
-                continue
-            edges.append((int(a), int(b), px))
-
-        # Relaxation to propagate prices
-        changed = True
-        iters = 0
-        while changed and iters < 10:
-            changed = False
-            iters += 1
-            for a, b, p in edges:
-                pa, pb = prices.get(a), prices.get(b)
-                if pb is not None and pa is None:
-                    prices[a] = p * pb
-                    changed = True
-                elif pa is not None and pb is None and p:
-                    prices[b] = pa / p
-                    changed = True
-
-        out: Dict[str, float] = {}
-        for idx, val in prices.items():
-            nm = name_of.get(idx)
-            if nm and isinstance(val, (int, float)) and val > 0:
-                out[nm] = float(val)
-        return out
-
-    @staticmethod
-    def _build_price_map(perp_meta: Dict[str, Any], spot_meta: Dict[str, Any]) -> Dict[str, float]:
-        """Merge: start with SPOT (USDC graph) → fill missing from PERP marks."""
-        mp = HyperliquidClient._build_spot_price_map(spot_meta)
-        try:
-            asset_ctxs = (perp_meta or {}).get("assetCtxs") or []
-            for ctx in asset_ctxs:
-                coin = ctx.get("name") or ctx.get("coin")
-                price = ctx.get("markPx") or ctx.get("oraclePx") or ctx.get("indexPx")
-                if coin and price is not None and coin not in mp:
-                    try:
-                        mp[coin] = float(price)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        return mp
-
-    @staticmethod
-    def perp_rows(state: Dict[str, Any], price_map: Dict[str, float]) -> List[Dict[str, Any]]:
+    def perp_rows(state: Dict[str, Any], price_of) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         positions = state.get("assetPositions") or state.get("positions") or []
         account_value = state.get("accountValue") or state.get("equity")
@@ -267,11 +170,16 @@ class HyperliquidClient:
             coin = core.get("coin") or core.get("symbol") or ""
             szi  = core.get("szi") or core.get("size") or 0
             entry = core.get("entryPx") or core.get("entryPrice") or None
-            mark  = pos.get("markPx") or core.get("markPx") or price_map.get(coin)
+
+            # Prefer mark from state; else price_of(coin)
+            mark = pos.get("markPx") or core.get("markPx")
+            if mark is None:
+                mark = price_of(coin)
+
             upnl  = pos.get("uPnL") or pos.get("unrealizedPnl") or core.get("uPnL") or 0
 
             try:
-                size = float(szi)
+                size = float(szi or 0)
             except Exception:
                 size = 0.0
             try:
@@ -314,17 +222,12 @@ class HyperliquidClient:
         return rows
 
     @staticmethod
-    def spot_rows(state: Dict[str, Any], price_map: Dict[str, float], idx_to_name: Optional[Dict[int, str]] = None) -> List[Dict[str, Any]]:
+    def spot_rows(state: Dict[str, Any], price_of) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         balances = state.get("balances") or state.get("assetPositions") or []
 
         for b in balances:
             coin = b.get("coin") or b.get("symbol")
-            if not coin and idx_to_name is not None and "token" in b:
-                try:
-                    coin = idx_to_name.get(int(b.get("token")))
-                except Exception:
-                    pass
 
             amt  = b.get("total") or b.get("size") or b.get("amount") or (b.get("position") or {}).get("szi")
             try:
@@ -332,9 +235,10 @@ class HyperliquidClient:
             except Exception:
                 amount = 0.0
 
+            # Prefer mark/oracle from state row; else price_of(coin)
             px = b.get("markPx") or b.get("oraclePx")
             if px is None and coin:
-                px = price_map.get(str(coin))
+                px = price_of(str(coin))
             try:
                 price = float(px) if px is not None else None
             except Exception:
@@ -347,7 +251,7 @@ class HyperliquidClient:
         return rows
 
 
-# ---------------- Hyperliquid WebSocket (live price) ----------------
+# ---------------- Hyperliquid WebSocket (allMids live) ----------------
 import threading
 import json as _json
 try:
@@ -357,26 +261,36 @@ except Exception:
 
 class HLWSClient:
     """
-    Minimal HL WS client that tracks last trade price and L2 mid for a given coin.
-    Threaded; safe for Streamlit. Call .start(), read .last_trade or .mid_px.
+    Live mid prices for ALL coins via `allMids`, plus BBO/trades fallback for a focus coin (default HYPE).
+    Threaded; safe for Streamlit. Call .start(), then use .mid_for("HYPE") etc.
     """
     URL = "wss://api.hyperliquid.xyz/ws"
 
-    def __init__(self, coin: str = "HYPE"):
-        self.coin = coin
+    def __init__(self, focus_coin: str = "HYPE"):
+        self.focus_coin = (focus_coin or "HYPE").upper()
         self.ws = None
         self.thread = None
         self._stop = threading.Event()
-        self.last_trade = None
+
+        self.mids: Dict[str, str] = {}  # symbol -> mid as string
+        self.last_trade = None          # focus fallback
         self.best_bid = None
         self.best_ask = None
         self.mid_px = None
 
+    @staticmethod
+    def _to_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
     def _on_open(self, ws):
-        sub_trades = {"method": "subscribe", "subscription": {"type": "trades", "coin": self.coin}}
-        sub_l2     = {"method": "subscribe", "subscription": {"type": "l2Book", "coin": self.coin}}
-        ws.send(_json.dumps(sub_trades))
-        ws.send(_json.dumps(sub_l2))
+        # All mids for every coin
+        ws.send(_json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
+        # Fallbacks for focus coin
+        ws.send(_json.dumps({"method": "subscribe", "subscription": {"type": "bbo", "coin": self.focus_coin}}))
+        ws.send(_json.dumps({"method": "subscribe", "subscription": {"type": "trades", "coin": self.focus_coin}}))
 
     def _on_message(self, ws, message):
         try:
@@ -384,38 +298,33 @@ class HLWSClient:
         except Exception:
             return
 
-        ch = msg.get("channel") or msg.get("type")
+        ch = msg.get("channel")
         data = msg.get("data")
+
+        if ch == "allMids" and isinstance(data, dict):
+            mids = data.get("mids") or {}
+            if isinstance(mids, dict):
+                self.mids = mids
+
+        if ch == "bbo" and isinstance(data, dict) and (data.get("coin") or "").upper() == self.focus_coin:
+            bbo = data.get("bbo") or [None, None]
+            bid, ask = bbo[0], bbo[1]
+            self.best_bid = self._to_float(bid.get("px")) if isinstance(bid, dict) else None
+            self.best_ask = self._to_float(ask.get("px")) if isinstance(ask, dict) else None
+            if self.best_bid is not None and self.best_ask is not None:
+                self.mid_px = (self.best_bid + self.best_ask) / 2.0
 
         if ch == "trades" and isinstance(data, list):
             for t in data:
-                if (t.get("coin") or t.get("symbol")) == self.coin and t.get("px") is not None:
-                    try:
-                        self.last_trade = float(t["px"])
-                    except Exception:
-                        pass
+                if (t.get("coin") or "").upper() == self.focus_coin:
+                    px = self._to_float(t.get("px"))
+                    if px is not None:
+                        self.last_trade = px
 
-        if ch == "l2Book" and isinstance(data, dict):
-            if (data.get("coin") or data.get("symbol")) == self.coin:
-                levels = data.get("levels") or {}
-                bids = levels.get("bids") or []
-                asks = levels.get("asks") or []
-                try:
-                    self.best_bid = float(bids[0][0]) if bids and bids[0] and bids[0][0] is not None else None
-                except Exception:
-                    self.best_bid = None
-                try:
-                    self.best_ask = float(asks[0][0]) if asks and asks[0] and asks[0][0] is not None else None
-                except Exception:
-                    self.best_ask = None
-                if self.best_bid is not None and self.best_ask is not None:
-                    self.mid_px = (self.best_bid + self.best_ask) / 2.0
-
-    def _on_error(self, ws, err):
-        # silent; UI will show fallbacks
+    def _on_error(self, ws, err):  # noqa: ARG002
         pass
 
-    def _on_close(self, ws, close_status_code, close_msg):
+    def _on_close(self, ws, code, reason):  # noqa: ARG002
         pass
 
     def _run(self):
@@ -450,6 +359,20 @@ class HLWSClient:
                 self.ws.close()
         except Exception:
             pass
+
+    def mid_for(self, symbol: str) -> Optional[float]:
+        if not symbol:
+            return None
+        s = symbol.upper()
+        # Primary: allMids
+        if s in self.mids:
+            v = self._to_float(self.mids.get(s))
+            if v and v > 0:
+                return v
+        # Fallback for focus coin
+        if s == self.focus_coin:
+            return self.mid_px or self.last_trade
+        return None
 
 
 # ---------------- Streamlit UI ----------------
@@ -525,18 +448,18 @@ if st:
         st.sidebar.success("Using DEBANK_API_KEY from secrets/env")
 
     include_hl = st.sidebar.toggle("Include Hyperliquid (perps & spot)", value=True)
-    use_ws_hype = st.sidebar.toggle("Use Hyperliquid WebSocket for live HYPE price", value=False)
-    link_hype_to_evm = st.sidebar.toggle("Link HYPE price to EVM token (DeBank)", value=False)
+    use_ws_live = st.sidebar.toggle("Use Hyperliquid WebSocket (allMids) for live prices", value=True)
+    link_hype_to_evm = st.sidebar.toggle("Override HYPE with EVM token price (DeBank)", value=False)
     hype_chain_id = st.sidebar.text_input("HYPEEVM chain_id (e.g., arb, eth, op)", value="arb", disabled=not link_hype_to_evm)
     hype_contract = st.sidebar.text_input("HYPEEVM contract (0x...)", value="", disabled=not link_hype_to_evm)
 
     # Start/stop WS thread based on toggle
-    if include_hl and use_ws_hype:
+    if include_hl and use_ws_live:
         if websocket is None:
             st.sidebar.warning("Install websocket-client to use live WS:  pip install websocket-client")
         else:
             if st.session_state.hl_ws is None:
-                st.session_state.hl_ws = HLWSClient(coin="HYPE")
+                st.session_state.hl_ws = HLWSClient(focus_coin="HYPE")
                 st.session_state.hl_ws.start()
     else:
         if st.session_state.hl_ws is not None:
@@ -787,27 +710,17 @@ if st:
             tokens = safe_call("Coins in wallet", api.get_all_token_list, w["addr"], True) or []
             st.dataframe(token_rows(tokens)[:25], use_container_width=True)
 
-        # Hyperliquid (REST + optional WS + optional EVM link)
+        # Hyperliquid (REST states + optional WS prices + optional EVM override for HYPE)
         if include_hl:
             st.markdown("#### Hyperliquid")
             hl_client = hl or HyperliquidClient()
 
             perp_state = safe_call("Hyperliquid perps", hl_client.get_perp_state, w["addr"]) or {}
             spot_state = safe_call("Hyperliquid spot", hl_client.get_spot_state, w["addr"]) or {}
-            perp_meta  = safe_call("Hyperliquid perp meta", hl_client.get_perp_meta) or {}
-            spot_meta  = safe_call("Hyperliquid spot meta", hl_client.get_spot_meta) or {}
 
-            # Price map from SPOT USDC graph + PERP fallback
-            price_map  = HyperliquidClient._build_price_map(perp_meta, spot_meta)
-
-            # If enabled, replace HYPE with live WS price (prefer mid, then last trade)
-            if use_ws_hype and st.session_state.hl_ws is not None:
-                live_px = st.session_state.hl_ws.mid_px or st.session_state.hl_ws.last_trade
-                if isinstance(live_px, (int, float)) and live_px > 0:
-                    price_map["HYPE"] = float(live_px)
-                    st.caption(f"⚡ HYPE price from WS: ${live_px:,.6f} (mid/trade)")
-
-            # If enabled, override HYPE with DeBank EVM token price (HYPEEVM)
+            # Build a price getter with precedence:
+            #  (1) DeBank HYPE override (if enabled) > (2) WS allMids live > (3) None (rows will use their own marks if present)
+            hype_override_price = None
             override_note = None
             if link_hype_to_evm and api and hype_contract.strip():
                 tok = safe_call("DeBank HYPEEVM token", api.get_token, hype_chain_id.strip(), hype_contract.strip())
@@ -818,29 +731,39 @@ if st:
                     except Exception:
                         p = 0.0
                     if p and p > 0:
-                        price_map["HYPE"] = p
-                        override_note = f"HYPE price overridden with DeBank {hype_chain_id}:{hype_contract} → ${p:,.6f}"
+                        hype_override_price = p
+                        override_note = f"🔗 HYPE overridden by DeBank {hype_chain_id}:{hype_contract} → ${p:,.6f}"
                     else:
                         override_note = "DeBank returned price=0 for the provided HYPEEVM contract."
             if override_note:
                 st.caption(override_note)
 
-            # Optional map from token index → name (for spot rows)
-            idx_to_name = {}
-            try:
-                meta = (spot_meta or [None])[0] or {}
-                idx_to_name = {t.get("index"): t.get("name") for t in meta.get("tokens", []) if t.get("index") is not None}
-            except Exception:
-                pass
+            def price_of(symbol: str) -> Optional[float]:
+                s = (symbol or "").upper()
+                # (1) explicit override for HYPE
+                if s == "HYPE" and hype_override_price:
+                    return hype_override_price
+                # (2) WS allMids (any coin), if enabled
+                if use_ws_live and st.session_state.hl_ws is not None:
+                    mid = st.session_state.hl_ws.mid_for(s)
+                    if isinstance(mid, (int, float)) and mid > 0:
+                        return float(mid)
+                # (3) otherwise None (row builders will try their own mark/oracle fields first)
+                return None
+
+            if use_ws_live and st.session_state.hl_ws is not None:
+                hype_live = st.session_state.hl_ws.mid_for("HYPE")
+                if isinstance(hype_live, (int, float)) and hype_live > 0 and not hype_override_price:
+                    st.caption(f"⚡ HYPE live mid (WS allMids): ${hype_live:,.6f}")
 
             h1, h2 = st.columns(2)
             with h1:
                 st.markdown("**Perps**")
-                perp_rows = HyperliquidClient.perp_rows(perp_state, price_map)
+                perp_rows = HyperliquidClient.perp_rows(perp_state, price_of)
                 st.dataframe(perp_rows, use_container_width=True)
             with h2:
                 st.markdown("**Spot**")
-                spot_rows = HyperliquidClient.spot_rows(spot_state, price_map, idx_to_name)
+                spot_rows = HyperliquidClient.spot_rows(spot_state, price_of)
                 st.dataframe(spot_rows, use_container_width=True)
 
 else:
