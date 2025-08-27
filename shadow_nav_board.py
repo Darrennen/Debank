@@ -156,6 +156,54 @@ class HyperliquidClient:
 
     def get_spot_state(self, addr: str) -> Dict[str, Any]:
         return self._post({"type": "spotClearinghouseState", "user": addr})
+    
+    # Get current market prices
+    def get_perp_prices(self) -> Dict[str, float]:
+        """Get current perpetual market prices"""
+        try:
+            data = self._post({"type": "allMids"})
+            prices = {}
+            if isinstance(data, list):
+                for i, price in enumerate(data):
+                    if price and price != "0":
+                        # Get asset name from meta info
+                        meta = self.get_meta_info()
+                        if meta and i < len(meta.get("universe", [])):
+                            asset_name = meta["universe"][i]["name"]
+                            prices[asset_name.upper()] = float(price)
+            return prices
+        except Exception:
+            return {}
+    
+    def get_spot_prices(self) -> Dict[str, float]:
+        """Get current spot market prices"""
+        try:
+            data = self._post({"type": "spotMids"})
+            prices = {}
+            if isinstance(data, list):
+                meta = self.get_spot_meta()
+                if meta:
+                    for i, price in enumerate(data):
+                        if price and price != "0" and i < len(meta.get("tokens", [])):
+                            token_name = meta["tokens"][i]["name"]
+                            prices[token_name.upper()] = float(price)
+            return prices
+        except Exception:
+            return {}
+    
+    def get_meta_info(self) -> Dict[str, Any]:
+        """Get perpetual market metadata"""
+        try:
+            return self._post({"type": "meta"})
+        except Exception:
+            return {}
+    
+    def get_spot_meta(self) -> Dict[str, Any]:
+        """Get spot market metadata"""
+        try:
+            return self._post({"type": "spotMeta"})
+        except Exception:
+            return {}
 
     # ---------- row builders; price comes ONLY from HYPEEVM (DeBank) ----------
     @staticmethod
