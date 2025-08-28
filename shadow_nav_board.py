@@ -116,183 +116,127 @@ class DebankClient:
 
 
 # ---------------- Hyperliquid client (positions only) ----------------
-class HyperliquidError(Exception):
-    pass
+# Enhanced HyperliquidClient methods to add to your existing class
 
-class HyperliquidClient:
-    INFO_URL = "https://api.hyperliquid.xyz/info"
+# Update the Hyperliquid section in your Streamlit app like this:
+def update_hyperliquid_section_in_streamlit():
+    """
+    Replace the Hyperliquid section in your Streamlit app with this enhanced version
+    """
+    if include_hl:
+        st.markdown("#### Hyperliquid (HYPE priced via HYPEEVM, others via HL)")
 
-    def __init__(self, timeout: int = 20, max_retries: int = 3, backoff: float = 0.8) -> None:
-        self.timeout = timeout
-        self.session = requests.Session()
-        retry = Retry(
-            total=max_retries,
-            backoff_factor=backoff,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["POST"],
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retry, pool_maxsize=50)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
+        # pull HYPEEVM price (if enabled)
+        hype_price = None
+        hype_note = None
+        if link_hype_to_evm and api and hype_contract.strip():
+            tok = safe_call("DeBank HYPEEVM token", api.get_token, hype_chain_id.strip(), hype_contract.strip())
+            if tok and isinstance(tok, dict):
+                p = tok.get("price")
+                try:
+                    p = float(p)
+                except Exception:
+                    p = 0.0
+                if p and p > 0:
+                    hype_price = p
+                    hype_note = f"Using HYPEEVM price from DeBank {hype_chain_id}:{hype_contract} → ${p:,.6f}"
+                else:
+                    hype_note = "DeBank returned price=0 for the provided HYPEEVM contract."
+        
+        # Get Hyperliquid spot prices
+        hl_client = hl or HyperliquidClient()
+        spot_prices = safe_call("HL spot prices", hl_client.get_spot_prices) or {}
+        
+        if hype_note:
+            st.caption(hype_note)
+        if spot_prices:
+            st.caption(f"Retrieved {len(spot_prices)} spot prices from Hyperliquid")
 
-    def _post(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        # fetch positions
+        perp_state = safe_call("HL perps", hl_client.get_perp_state, w["addr"]) or {}
+        spot_state = safe_call("HL spot", hl_client.get_spot_state, w["addr"]) or {}
+
+        h1, h2 = st.columns(2)
+        with h1:
+            st.markdown("**Perps**")
+            perp_rows = HyperliquidClient.perp_rows(perp_state, hype_price)
+            st.dataframe(perp_rows, use_container_width=True)
+        with h2:
+            st.markdown("**Spot**")
+            # Use the enhanced spot_rows method with both price sources
+            spot_rows = HyperliquidClient.spot_rows_with_prices(spot_state, hype_price, spot_prices)
+            st.dataframe(spot_rows, use_container_width=True)
+
+# Enhanced HyperliquidClient methods to add to your existing class
+
+def get_spot_prices(self) -> Dict[str, float]:
+    """Get current spot market prices from Hyperliquid"""
+    try:
+        data = self._post({"type": "spotMids"})
+        prices = {}
+        if isinstance(data, list):
+            meta = self.get_spot_meta()
+            if meta and "tokens" in meta:
+                for i, price_str in enumerate(data):
+                    if price_str and price_str != "0" and i < len(meta["tokens"]):
+                        token_info = meta["tokens"][i]
+                        token_name = token_info.get("name", "").upper()
+                        try:
+                            prices[token_name] = float(price_str)
+                        except (ValueError, TypeError):
+                            continue
+        return prices
+    except Exception as e:
+        print(f"Error getting spot prices: {e}")
+        return {}
+
+def get_spot_meta(self) -> Dict[str, Any]:
+    """Get spot market metadata"""
+    try:
+        return self._post({"type": "spotMeta"})
+    except Exception:
+        return {}
+
+@staticmethod
+def spot_rows_with_prices(state: Dict[str, Any], hype_price: Optional[float], spot_prices: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
+    """Enhanced spot_rows method that uses both HYPEEVM price for HYPE and Hyperliquid prices for other tokens"""
+    rows: List[Dict[str, Any]] = []
+    balances = state.get("balances") or state.get("assetPositions") or []
+    spot_prices = spot_prices or {}
+
+    for b in balances:
+        coin = (b.get("coin") or b.get("symbol") or "").upper()
+
+        amt = b.get("total") or b.get("size") or b.get("amount") or (b.get("position") or {}).get("szi")
         try:
-            r = self.session.post(self.INFO_URL, json=payload, timeout=self.timeout)
-        except requests.exceptions.RequestException as e:
-            raise HyperliquidError(f"Network error calling HL info: {e}") from e
-        try:
-            r.raise_for_status()
-        except requests.HTTPError as e:
-            raise HyperliquidError(f"HTTP {r.status_code} from HL info: {r.text[:400]}") from e
-        try:
-            return r.json()
-        except Exception as e:
-            raise HyperliquidError(f"Bad JSON from HL info: {e}") from e
-
-    # Positions only (no pricing)
-    def get_perp_state(self, addr: str) -> Dict[str, Any]:
-        return self._post({"type": "clearinghouseState", "user": addr})
-
-    def get_spot_state(self, addr: str) -> Dict[str, Any]:
-        return self._post({"type": "spotClearinghouseState", "user": addr})
-    
-    # Get current market prices
-    def get_perp_prices(self) -> Dict[str, float]:
-        """Get current perpetual market prices"""
-        try:
-            data = self._post({"type": "allMids"})
-            prices = {}
-            if isinstance(data, list):
-                for i, price in enumerate(data):
-                    if price and price != "0":
-                        # Get asset name from meta info
-                        meta = self.get_meta_info()
-                        if meta and i < len(meta.get("universe", [])):
-                            asset_name = meta["universe"][i]["name"]
-                            prices[asset_name.upper()] = float(price)
-            return prices
+            amount = float(amt or 0)
         except Exception:
-            return {}
+            amount = 0.0
+
+        # Price priority: HYPE uses HYPEEVM price, others use Hyperliquid spot prices
+        price = None
+        price_source = None
+        
+        if coin == "HYPE" and isinstance(hype_price, (int, float)) and hype_price > 0:
+            price = float(hype_price)
+            price_source = "HYPEEVM"
+        elif coin in spot_prices:
+            price = spot_prices[coin]
+            price_source = "HL Spot"
+        
+        usd = amount * price if (price is not None) else None
+        
+        rows.append({
+            "Coin": coin,
+            "Amount": amount,
+            "Price": price,
+            "Price Source": price_source,
+            "USD Value": usd
+        })
+
+    rows.sort(key=lambda r: abs(r.get("USD Value") or 0), reverse=True)
+    return rows
     
-    def get_spot_prices(self) -> Dict[str, float]:
-        """Get current spot market prices"""
-        try:
-            data = self._post({"type": "spotMids"})
-            prices = {}
-            if isinstance(data, list):
-                meta = self.get_spot_meta()
-                if meta:
-                    for i, price in enumerate(data):
-                        if price and price != "0" and i < len(meta.get("tokens", [])):
-                            token_name = meta["tokens"][i]["name"]
-                            prices[token_name.upper()] = float(price)
-            return prices
-        except Exception:
-            return {}
-    
-    def get_meta_info(self) -> Dict[str, Any]:
-        """Get perpetual market metadata"""
-        try:
-            return self._post({"type": "meta"})
-        except Exception:
-            return {}
-    
-    def get_spot_meta(self) -> Dict[str, Any]:
-        """Get spot market metadata"""
-        try:
-            return self._post({"type": "spotMeta"})
-        except Exception:
-            return {}
-
-    # ---------- row builders; price comes ONLY from HYPEEVM (DeBank) ----------
-    @staticmethod
-    def perp_rows(state: Dict[str, Any], hype_price: Optional[float]) -> List[Dict[str, Any]]:
-        rows: List[Dict[str, Any]] = []
-        positions = state.get("assetPositions") or state.get("positions") or []
-        account_value = state.get("accountValue") or state.get("equity")
-
-        for pos in positions:
-            core = pos.get("position") or pos
-            coin = (core.get("coin") or core.get("symbol") or "").upper()
-            szi  = core.get("szi") or core.get("size") or 0
-            entry = core.get("entryPx") or core.get("entryPrice") or None
-
-            # We DO NOT use HL price; only HYPE uses HYPEEVM price
-            mark = None
-            if coin == "HYPE" and isinstance(hype_price, (int, float)) and hype_price > 0:
-                mark = hype_price
-
-            upnl  = pos.get("uPnL") or pos.get("unrealizedPnl") or core.get("uPnL") or 0
-
-            try:
-                size = float(szi or 0)
-            except Exception:
-                size = 0.0
-            try:
-                entry_f = float(entry) if entry is not None else None
-            except Exception:
-                entry_f = None
-            try:
-                mark_f = float(mark) if mark is not None else None
-            except Exception:
-                mark_f = None
-            try:
-                upnl_f = float(upnl) if upnl is not None else 0.0
-            except Exception:
-                upnl_f = 0.0
-
-            usd_val = size * mark_f if mark_f is not None else None
-
-            rows.append({
-                "Market": coin,
-                "Size": size,
-                "Entry": entry_f,
-                "Price (HYPEEVM)": mark_f if coin == "HYPE" else None,
-                "uPnL": upnl_f,
-                "USD Value": usd_val,
-            })
-
-        if not rows and account_value is not None:
-            try:
-                rows.append({"Market": "(Account)", "Size": None, "Entry": None,
-                             "Price (HYPEEVM)": None, "uPnL": None, "USD Value": float(account_value)})
-            except Exception:
-                pass
-
-        def sort_key(r):
-            v = r.get("USD Value")
-            if v is None:
-                return abs(r.get("uPnL") or 0)
-            return abs(v)
-        rows.sort(key=sort_key, reverse=True)
-        return rows
-
-    @staticmethod
-    def spot_rows(state: Dict[str, Any], hype_price: Optional[float]) -> List[Dict[str, Any]]:
-        rows: List[Dict[str, Any]] = []
-        balances = state.get("balances") or state.get("assetPositions") or []
-
-        for b in balances:
-            coin = (b.get("coin") or b.get("symbol") or "").upper()
-
-            amt  = b.get("total") or b.get("size") or b.get("amount") or (b.get("position") or {}).get("szi")
-            try:
-                amount = float(amt or 0)
-            except Exception:
-                amount = 0.0
-
-            # Only HYPE gets a price (from HYPEEVM); others stay None
-            price = None
-            if coin == "HYPE" and isinstance(hype_price, (int, float)) and hype_price > 0:
-                price = float(hype_price)
-
-            usd = amount * price if (price is not None) else None
-            rows.append({"Coin": coin, "Amount": amount, "Price (HYPEEVM)": price, "USD Value": usd})
-
-        rows.sort(key=lambda r: abs(r.get("USD Value") or 0), reverse=True)
-        return rows
-
 
 # ---------------- Streamlit UI ----------------
 try:
