@@ -1,7 +1,8 @@
 # shadow_nav_board.py
 # Shadow NAV board — one-page UI with per-wallet comment log + persistence.
 # - DeBank (Pro OpenAPI) for on-chain EVM assets: total balance, token list, DeFi positions
-# - Hyperliquid: show positions (perps & spot) with enhanced pricing
+# - Hyperliquid: show positions (perps & spot) WITHOUT mid-price fetching
+# - HYPE may use HYPEEVM (DeBank) token price override (optional)
 # - Persists wallets/comments/selection to shadow_nav_store.json
 # - Uses Streamlit secrets/env for DEBANK_API_KEY so you aren't prompted each time
 
@@ -33,7 +34,7 @@ class DebankClient:
         max_retries: int = 3,
         backoff: float = 0.8,
         proxies: Optional[Dict[str, str]] = None,
-        user_agent: str = "shadow-nav/board/2.1",
+        user_agent: str = "shadow-nav/board/2.2",
     ) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.api_key = api_key or os.getenv("DEBANK_API_KEY")
@@ -110,7 +111,7 @@ class DebankClient:
         return self._get("/v1/token", {"chain_id": chain_id, "id": token_addr})
 
 
-# ---------------- Hyperliquid client (enhanced with pricing) ----------------
+# ---------------- Hyperliquid client (positions only) ----------------
 class HyperliquidError(Exception):
     pass
 
@@ -145,98 +146,12 @@ class HyperliquidClient:
         except Exception as e:
             raise HyperliquidError(f"Bad JSON from HL info: {e}") from e
 
-    # Positions only (no pricing)
+    # Positions only (no mid prices fetched)
     def get_perp_state(self, addr: str) -> Dict[str, Any]:
         return self._post({"type": "clearinghouseState", "user": addr})
 
     def get_spot_state(self, addr: str) -> Dict[str, Any]:
         return self._post({"type": "spotClearinghouseState", "user": addr})
-    
-    # Get current market prices
-    def get_perp_prices(self) -> Dict[str, float]:
-        """Get current perpetual market prices"""
-        try:
-            data = self._post({"type": "allMids"})
-            prices = {}
-            if isinstance(data, list):
-                for i, price in enumerate(data):
-                    if price and price != "0":
-                        # Get asset name from meta info
-                        meta = self.get_meta_info()
-                        if meta and i < len(meta.get("universe", [])):
-                            asset_name = meta["universe"][i]["name"]
-                            prices[asset_name.upper()] = float(price)
-            return prices
-        except Exception:
-            return {}
-    
-def get_spot_prices(self) -> Dict[str, float]:
-    """Get current spot market prices from Hyperliquid"""
-    try:
-        data = self._post({"type": "spotMids"})
-        prices = {}
-        if isinstance(data, list):
-            meta = self.get_spot_meta()
-            if meta and "tokens" in meta:
-                for i, price_str in enumerate(data):
-                    if price_str and price_str != "0" and i < len(meta["tokens"]):
-                        token_info = meta["tokens"][i]
-                        token_name = token_info.get("name", "").upper()
-                        try:
-                            prices[token_name] = float(price_str)
-                        except (ValueError, TypeError):
-                            continue
-        return prices
-    except Exception as e:
-        return {}
-
-def get_spot_meta(self) -> Dict[str, Any]:
-    """Get spot market metadata"""
-    try:
-        return self._post({"type": "spotMeta"})
-    except Exception:
-        return {}
-
-# Replace your existing spot_rows method with this enhanced version:
-@staticmethod
-def spot_rows_enhanced(state: Dict[str, Any], hype_price: Optional[float], spot_prices: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
-    """Enhanced spot_rows method that uses both HYPEEVM price for HYPE and Hyperliquid prices for other tokens"""
-    rows: List[Dict[str, Any]] = []
-    balances = state.get("balances") or state.get("assetPositions") or []
-    spot_prices = spot_prices or {}
-
-    for b in balances:
-        coin = (b.get("coin") or b.get("symbol") or "").upper()
-
-        amt = b.get("total") or b.get("size") or b.get("amount") or (b.get("position") or {}).get("szi")
-        try:
-            amount = float(amt or 0)
-        except Exception:
-            amount = 0.0
-
-        # Price priority: HYPE uses HYPEEVM price, others use Hyperliquid spot prices
-        price = None
-        price_source = None
-        
-        if coin == "HYPE" and isinstance(hype_price, (int, float)) and hype_price > 0:
-            price = float(hype_price)
-            price_source = "HYPEEVM"
-        elif coin in spot_prices:
-            price = spot_prices[coin]
-            price_source = "HL Spot"
-        
-        usd = amount * price if (price is not None) else None
-        
-        rows.append({
-            "Coin": coin,
-            "Amount": amount,
-            "Price": price,
-            "Price Source": price_source,
-            "USD Value": usd
-        })
-
-    rows.sort(key=lambda r: abs(r.get("USD Value") or 0), reverse=True)
-    return rows
 
     # ---------- row builders; price comes ONLY from HYPEEVM (DeBank) ----------
     @staticmethod
@@ -251,7 +166,7 @@ def spot_rows_enhanced(state: Dict[str, Any], hype_price: Optional[float], spot_
             szi  = core.get("szi") or core.get("size") or 0
             entry = core.get("entryPx") or core.get("entryPrice") or None
 
-            # We DO NOT use HL price; only HYPE uses HYPEEVM price
+            # Only HYPE shows a price via HYPEEVM; we do not fetch HL marks/mids.
             mark = None
             if coin == "HYPE" and isinstance(hype_price, (int, float)) and hype_price > 0:
                 mark = hype_price
@@ -302,34 +217,31 @@ def spot_rows_enhanced(state: Dict[str, Any], hype_price: Optional[float], spot_
         return rows
 
     @staticmethod
-    def spot_rows_with_prices(state: Dict[str, Any], hype_price: Optional[float], spot_prices: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
-        """Enhanced spot_rows method that uses both HYPEEVM price for HYPE and Hyperliquid prices for other tokens"""
+    def spot_rows(state: Dict[str, Any], hype_price: Optional[float]) -> List[Dict[str, Any]]:
+        """
+        Show spot balances. Only HYPE gets a price from HYPEEVM.
+        Others show amount only, with no price/valuation.
+        """
         rows: List[Dict[str, Any]] = []
         balances = state.get("balances") or state.get("assetPositions") or []
-        spot_prices = spot_prices or {}
 
         for b in balances:
             coin = (b.get("coin") or b.get("symbol") or "").upper()
-
             amt = b.get("total") or b.get("size") or b.get("amount") or (b.get("position") or {}).get("szi")
             try:
                 amount = float(amt or 0)
             except Exception:
                 amount = 0.0
 
-            # Price priority: HYPE uses HYPEEVM price, others use Hyperliquid spot prices
             price = None
             price_source = None
-            
+
             if coin == "HYPE" and isinstance(hype_price, (int, float)) and hype_price > 0:
                 price = float(hype_price)
                 price_source = "HYPEEVM"
-            elif coin in spot_prices:
-                price = spot_prices[coin]
-                price_source = "HL Spot"
-            
+
             usd = amount * price if (price is not None) else None
-            
+
             rows.append({
                 "Coin": coin,
                 "Amount": amount,
@@ -660,11 +572,9 @@ if st:
             tokens = safe_call("Coins in wallet", api.get_all_token_list, w["addr"], True) or []
             st.dataframe(token_rows(tokens)[:25], use_container_width=True)
 
-        # Hyperliquid (positions with enhanced pricing)
+        # Hyperliquid (positions only; HYPE optionally priced via HYPEEVM)
         if include_hl:
-            st.markdown("#### Hyperliquid (HYPE priced via HYPEEVM, others via HL)")
-
-            # pull HYPEEVM price (if enabled)
+            st.markdown("#### Hyperliquid (positions only; HYPE priced via HYPEEVM if provided)")
             hype_price = None
             hype_note = None
             if link_hype_to_evm and api and hype_contract.strip():
@@ -680,5 +590,17 @@ if st:
                         hype_note = f"Using HYPEEVM price from DeBank {hype_chain_id}:{hype_contract} → ${p:,.6f}"
                     else:
                         hype_note = "DeBank returned price=0 for the provided HYPEEVM contract."
-            
-            # Get Hyperliquid spot prices
+
+            if hype_note:
+                st.caption(hype_note)
+
+            hl_perp = safe_call("HL perp", hl.get_perp_state, w["addr"]) if hl else None
+            hl_spot = safe_call("HL spot", hl.get_spot_state, w["addr"]) if hl else None
+
+            c_perp, c_spot = st.columns(2)
+            with c_perp:
+                st.markdown("**Perp Positions**")
+                st.dataframe(HyperliquidClient.perp_rows(hl_perp or {}, hype_price), use_container_width=True)
+            with c_spot:
+                st.markdown("**Spot Balances**")
+                st.dataframe(HyperliquidClient.spot_rows(hl_spot or {}, hype_price), use_container_width=True)
