@@ -170,7 +170,7 @@ class HyperliquidClient:
         except Exception:
             return {}
     
-    def get_spot_prices(self) -> Dict[str, float]:
+def get_spot_prices(self) -> Dict[str, float]:
     """Get current spot market prices from Hyperliquid"""
     try:
         data = self._post({"type": "spotMids"})
