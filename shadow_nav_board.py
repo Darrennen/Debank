@@ -171,39 +171,72 @@ class HyperliquidClient:
             return {}
     
     def get_spot_prices(self) -> Dict[str, float]:
-        """Get current spot market prices from Hyperliquid"""
+    """Get current spot market prices from Hyperliquid"""
+    try:
+        data = self._post({"type": "spotMids"})
+        prices = {}
+        if isinstance(data, list):
+            meta = self.get_spot_meta()
+            if meta and "tokens" in meta:
+                for i, price_str in enumerate(data):
+                    if price_str and price_str != "0" and i < len(meta["tokens"]):
+                        token_info = meta["tokens"][i]
+                        token_name = token_info.get("name", "").upper()
+                        try:
+                            prices[token_name] = float(price_str)
+                        except (ValueError, TypeError):
+                            continue
+        return prices
+    except Exception as e:
+        return {}
+
+def get_spot_meta(self) -> Dict[str, Any]:
+    """Get spot market metadata"""
+    try:
+        return self._post({"type": "spotMeta"})
+    except Exception:
+        return {}
+
+# Replace your existing spot_rows method with this enhanced version:
+@staticmethod
+def spot_rows_enhanced(state: Dict[str, Any], hype_price: Optional[float], spot_prices: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
+    """Enhanced spot_rows method that uses both HYPEEVM price for HYPE and Hyperliquid prices for other tokens"""
+    rows: List[Dict[str, Any]] = []
+    balances = state.get("balances") or state.get("assetPositions") or []
+    spot_prices = spot_prices or {}
+
+    for b in balances:
+        coin = (b.get("coin") or b.get("symbol") or "").upper()
+
+        amt = b.get("total") or b.get("size") or b.get("amount") or (b.get("position") or {}).get("szi")
         try:
-            data = self._post({"type": "spotMids"})
-            prices = {}
-            if isinstance(data, list):
-                meta = self.get_spot_meta()
-                if meta and "tokens" in meta:
-                    for i, price_str in enumerate(data):
-                        if price_str and price_str != "0" and i < len(meta["tokens"]):
-                            token_info = meta["tokens"][i]
-                            token_name = token_info.get("name", "").upper()
-                            try:
-                                prices[token_name] = float(price_str)
-                            except (ValueError, TypeError):
-                                continue
-            return prices
-        except Exception as e:
-            print(f"Error getting spot prices: {e}")
-            return {}
-    
-    def get_meta_info(self) -> Dict[str, Any]:
-        """Get perpetual market metadata"""
-        try:
-            return self._post({"type": "meta"})
+            amount = float(amt or 0)
         except Exception:
-            return {}
-    
-    def get_spot_meta(self) -> Dict[str, Any]:
-        """Get spot market metadata"""
-        try:
-            return self._post({"type": "spotMeta"})
-        except Exception:
-            return {}
+            amount = 0.0
+
+        # Price priority: HYPE uses HYPEEVM price, others use Hyperliquid spot prices
+        price = None
+        price_source = None
+        
+        if coin == "HYPE" and isinstance(hype_price, (int, float)) and hype_price > 0:
+            price = float(hype_price)
+            price_source = "HYPEEVM"
+        elif coin in spot_prices:
+            price = spot_prices[coin]
+            price_source = "HL Spot"
+        
+        usd = amount * price if (price is not None) else None
+        
+        rows.append({
+            "Coin": coin,
+            "Amount": amount,
+            "Price": price,
+            "Price Source": price_source,
+            "USD Value": usd
+        })
+
+    rows.sort(key=lambda r: abs(r.get("USD Value") or 0), reverse=True)
+    return rows
 
     # ---------- row builders; price comes ONLY from HYPEEVM (DeBank) ----------
     @staticmethod
